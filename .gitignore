@@ -8,3 +8,9 @@ logs/
 
 # backups locais das versoes que funcionaram
 *.v*-ok.ps1
+
+# contexto pessoal do sugerir.ps1 (nao versionar)
+sugerir-contexto.txt
+
+# respostas prontas pessoais (o exemplo versionado e respostas.exemplo.txt)
+respostas.txt

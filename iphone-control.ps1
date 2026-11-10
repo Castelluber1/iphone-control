@@ -23,7 +23,9 @@
 #   Ctrl+Shift+F12 = liga/desliga a captura (de qualquer janela)
 #   Ctrl+Shift+F11 = janela do espelho sempre no topo (liga/desliga)
 #   Ctrl+Shift+F10 = afixar o espelho na altura da tela (liga/desliga; padrao ligado, -NoFit desliga)
-#   Esc durante um Ctrl+V longo = cancela a digitacao | chip CONTROLE LIGADO/DESLIGADO na barra de titulo do espelho
+#   Esc durante um Ctrl+V longo = cancela a digitacao | Esc fora disso = voltar (toca no "<" do canto, -BackX/-BackY)
+#   Ctrl+Shift+1..9 = digita a resposta pronta N do respostas.txt (nunca aperta Enter) | Ctrl+Shift+S = roda o sugerir.ps1
+#   chip CONTROLE LIGADO/DESLIGADO na barra de titulo do espelho
 #   No console: mesmos comandos do canal local (ver HandleCommand), texto solto = digitar, q = sair
 param(
     [switch]$SelfTest, [switch]$SelfTestAdvertise,
@@ -36,6 +38,7 @@ param(
     [double]$VideoAspect = 0,
     [switch]$NoFit,                                    # nao encaixar a janela do espelho na altura util da tela
     [int]$KeyDelayMs = 12,                             # pausa apos apertar e apos soltar cada tecla (12 = valor testado; menor = mais rapido)
+    [double]$BackX = 0.05, [double]$BackY = 0.077,     # 'voltar' / Esc: toque no botao "<" do canto superior esquerdo (retrato)
     [string]$WindowTitle = 'AirPlay Video Stream'
 )
 
@@ -184,8 +187,31 @@ public static class IPC {
     // ---------------- hooks ----------------
     static HookProc mouseProc, keyProc;
     static uint hookTid;
-    static bool dragging = false, passThrough = false;
+    static volatile bool dragging = false, passThrough = false;
     static bool lshift, rshift, lctrl, rctrl, lalt, ralt, lwin, rwin;
+    // "dedo preso": o soltar (WM_LBUTTONUP) pode se perder (Win+L, UAC, hook atrasado). StuckCheck solta sozinho.
+    static readonly object dragLock = new object();
+    static int dragStartTick, dragEvtTick, stuckUpCount;
+    public static bool Dragging { get { return dragging; } }
+    // Chamado a cada 200 ms (thread do indicador). GetAsyncKeyState so vale quando o clique PASSOU para o Windows:
+    // clique engolido pelo hook nao atualiza o estado assincrono do botao, entao ai vale o foco e o tempo sem movimento.
+    public static void StuckCheck() {
+        if (!dragging) return;
+        lock (dragLock) {
+            if (!dragging) return;
+            int now = Environment.TickCount; string why = null;
+            IntPtr h = Window();
+            if (h == IntPtr.Zero) why = "janela do espelho sumiu";
+            else if (passThrough) {
+                if (now - dragStartTick > 300) {
+                    if ((GetAsyncKeyState(0x01) & 0x8000) == 0) { if (++stuckUpCount >= 2) why = "botao fisico ja solto"; }
+                    else stuckUpCount = 0;
+                }
+            } else if (now - dragStartTick > 600 && GetForegroundWindow() != h) why = "foco saiu do espelho (Win+L, UAC ou troca de janela)";
+            if (why == null && now - dragEvtTick > 15000) why = "15 s sem movimento com o dedo encostado";
+            if (why != null) { dragging = false; Push("stuck " + why); Push("up "); }
+        }
+    }
 
     public static void StartHooks() {
         Thread t = new Thread(HookLoop); t.IsBackground = true; t.Start();
@@ -215,33 +241,61 @@ public static class IPC {
                 MSLL m = (MSLL)Marshal.PtrToStructure(l, typeof(MSLL));
                 bool injected = (m.flags & 1) != 0;
                 RECT v;
-                if (dragging) {
-                    if (msg == 0x0200) {                     // arrastando: move (o cursor do Windows anda normal)
-                        if (VideoRect(Window(), out v)) Push("move " + Norm(v, m.pt));
-                    } else if (msg == 0x0202) {              // soltou
-                        dragging = false;
-                        Push("up " + (VideoRect(Window(), out v) ? Norm(v, m.pt) : ""));
-                        if (!passThrough) return new IntPtr(1);
+                if (msg == 0x020A) return WheelProc(code, w, l, m, injected);
+                lock (dragLock) {
+                    if (dragging && msg == 0x0201 && !injected) {   // clique novo com o dedo ainda encostado: o soltar anterior se perdeu
+                        dragging = false; Push("stuck clique novo com o dedo ainda encostado"); Push("up ");
                     }
-                } else if (Enabled && !injected && (msg == 0x0201 || msg == 0x020A)) {
-                    IntPtr h = Window();
-                    if (h != IntPtr.Zero && VideoRect(h, out v) && Inside(v, m.pt) && GetAncestor(WindowFromPoint(m.pt), 2) == h) {
-                        if (msg == 0x0201) {
-                            dragging = true;
+                    if (dragging) {
+                        if (msg == 0x0200) {                     // arrastando: move (o cursor do Windows anda normal)
+                            dragEvtTick = Environment.TickCount;
+                            if (VideoRect(Window(), out v)) Push("move " + Norm(v, m.pt));
+                        } else if (msg == 0x0202) {              // soltou
+                            dragging = false;
+                            Push("up " + (VideoRect(Window(), out v) ? Norm(v, m.pt) : ""));
+                            if (!passThrough) return new IntPtr(1);
+                        }
+                    } else if (Enabled && !injected && msg == 0x0201) {
+                        IntPtr h = Window();
+                        if (h != IntPtr.Zero && VideoRect(h, out v) && Inside(v, m.pt) && GetAncestor(WindowFromPoint(m.pt), 2) == h) {
+                            dragging = true; dragStartTick = dragEvtTick = Environment.TickCount; stuckUpCount = 0;
                             // janela sem foco: o 1o clique tambem passa para ela, assim ela ganha o foco do teclado
                             passThrough = GetForegroundWindow() != h;
                             Push("down " + Norm(v, m.pt));
                             if (!passThrough) return new IntPtr(1);
-                        } else if (Connected) {
-                            int delta = (short)((m.mouseData >> 16) & 0xFFFF);
-                            Push("wheel " + (delta > 0 ? 1 : -1) + " " + Norm(v, m.pt));
-                            return new IntPtr(1);
                         }
                     }
                 }
             }
         } catch (Exception) { }
         return CallNextHookEx(IntPtr.Zero, code, w, l);
+    }
+
+    // Rodinha: sem exigir "Connected" (era a regressao: com ele falso a rodinha passava para o Windows e o iPhone nao rolava;
+    // sem iPhone o PowerShell so ignora e avisa). Aceita rodinha injetada (driver de mouse com rolagem suave injeta) e
+    // acumula deltas pequenos ate 120 = 1 tick. Diagnostico: 1 linha por rajada (recebida, injetada?, motivo se ignorada).
+    static int wheelAcc = 0, lastWheelTick = -100000;
+    static IntPtr WheelProc(int code, IntPtr w, IntPtr l, MSLL m, bool injected) {
+        int now = Environment.TickCount;
+        int delta = (short)((m.mouseData >> 16) & 0xFFFF);
+        bool newBurst = now - lastWheelTick > 1500;
+        string why = null; RECT v = new RECT(); IntPtr h = Window();
+        if (!Enabled) why = "captura desligada";
+        else if (dragging) why = "arrastando";
+        else if (h == IntPtr.Zero) why = "janela '" + Title + "' nao encontrada";
+        else if (!VideoRect(h, out v) || !Inside(v, m.pt)) why = "fora da area de video";
+        else {
+            IntPtr under = GetAncestor(WindowFromPoint(m.pt), 2);
+            if (under != h && under != chipHwnd) why = "outra janela por cima do espelho (" + ProcOf(under) + ")";
+        }
+        if (newBurst) Push("wheeldiag Rodinha: delta " + delta + (injected ? " (injetada)" : "") + (why == null ? " -> rola o iPhone" : " -> IGNORADA: " + why) + " | iPhone inscrito=" + (Connected ? "sim" : "nao"));
+        if (why != null) { lastWheelTick = now; return CallNextHookEx(IntPtr.Zero, code, w, l); }
+        if (now - lastWheelTick > 400) wheelAcc = 0;
+        lastWheelTick = now;
+        wheelAcc += delta;
+        int ticks = wheelAcc / 120;
+        if (ticks != 0) { wheelAcc -= ticks * 120; Push("wheel " + ticks + " " + Norm(v, m.pt)); }
+        return new IntPtr(1);
     }
 
     static int SpecialUsage(uint vk) {
@@ -457,6 +511,9 @@ public static class IPC {
                         if (up) { if (vk == 0x56) vHeld = false; return new IntPtr(1); }
                         if (down) {
                             if (Typing && vk == 0x1B) { CancelTyping = true; return new IntPtr(1); }   // Esc cancela o colar em andamento
+                            if (vk == 0x1B && !ctrl && !shift) { Push("back"); return new IntPtr(1); }   // Esc = voltar (o iOS nao trata Esc como voltar)
+                            if (ctrl && shift && vk >= 0x31 && vk <= 0x39) { Push("reply " + (vk - 0x30)); return new IntPtr(1); }   // Ctrl+Shift+1..9 = resposta pronta N
+                            if (ctrl && shift && vk == 0x53) { Push("suggest"); return new IntPtr(1); }   // Ctrl+Shift+S = sugerir.ps1
                             int mods = (shift ? 0x02 : 0) | (ctrl ? 0x08 : 0);       // Ctrl do PC -> Cmd do iPhone
                             int usage = SpecialUsage(vk);
                             if (usage != 0) { Push("key " + usage + " " + mods); return new IntPtr(1); }
@@ -625,6 +682,7 @@ public static class IPC {
         }
     }
     static Chip chip;
+    static IntPtr chipHwnd = IntPtr.Zero;   // o hook compara com isto (Control.Handle nao pode ser lido de outra thread)
     public static void StartOverlay() {
         Thread t = new Thread(delegate() {
             try {
@@ -633,7 +691,7 @@ public static class IPC {
                 f.StartPosition = System.Windows.Forms.FormStartPosition.Manual; f.Location = new Point(-32000, -32000); f.Size = new Size(20, 10);
                 f.Opacity = 0.93;
                 IntPtr force = f.Handle;
-                chip = f;
+                chipHwnd = force; chip = f;
                 System.Windows.Forms.Timer tm = new System.Windows.Forms.Timer(); tm.Interval = 200;
                 tm.Tick += delegate { try { OverlayTick(f); } catch (Exception ex) { OverlayStatus = "erro: " + ex.Message; } };
                 tm.Start();
@@ -654,6 +712,7 @@ public static class IPC {
         IntPtr h = Window();
         if (MirrorTopmost && h != IntPtr.Zero && h != topmostApplied) ApplyTopmost();   // janela renasceu: reaplica
         try { FitTick(h); } catch (Exception ex) { FitStatus = "erro: " + ex.Message; }
+        try { StuckCheck(); } catch (Exception) { }
         RECT wr, c;
         if (h == IntPtr.Zero || !IsWindowVisible(h) || IsIconic(h) || !GetWindowRect(h, out wr) || !ClientScreen(h, out c)) { if (f.Visible) f.Hide(); return; }
         double sc = 1.0; try { uint d = GetDpiForWindow(h); if (d > 0) sc = d / 96.0; } catch (Exception) { }
@@ -1195,7 +1254,7 @@ function DoTap([double]$u, [double]$v, [int]$holdMs = 60) {
     $r = PointerDown $u $v; if ($r -ne 'ok') { return $r }
     Start-Sleep -Milliseconds $holdMs; PointerUp; 'ok'
 }
-function DoSwipe([double]$u1, [double]$v1, [double]$u2, [double]$v2, [int]$ms = 300) {
+function DoSwipe([double]$u1, [double]$v1, [double]$u2, [double]$v2, [int]$ms = 300, [int]$holdMs = 0) {
     if (-not (Ready)) { return 'NAO ENVIADO: iPhone sem inscricao' }
     $r = PointerDown $u1 $v1; if ($r -ne 'ok') { return $r }
     $steps = [Math]::Max(5, [int]($ms / 16)); $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -1204,6 +1263,7 @@ function DoSwipe([double]$u1, [double]$v1, [double]$u2, [double]$v2, [int]$ms = 
         PointerMove ($u1 + ($u2 - $u1) * $t) ($v1 + ($v2 - $v1) * $t)
         $wait = [int]($ms * $t - $sw.ElapsedMilliseconds); if ($wait -gt 0) { Start-Sleep -Milliseconds $wait }
     }
+    if ($holdMs -gt 0) { Start-Sleep -Milliseconds $holdMs }   # segura parado antes de soltar (alternador de apps)
     PointerUp; 'ok'
 }
 # Rolagem = swipe (o iOS ignorou a roda HID no WhatsApp; swipe rolou, teste 2026-11-10).
@@ -1222,6 +1282,113 @@ function DoScrollSwipe([int]$ticks, [double]$u, [double]$v) {
 }
 function DoWheel([int]$dir, [double]$u, [double]$v) {
     if ($Relative) { $null = RelReport 0 0 $script:btn $dir } else { $null = AbsReport $u $v $script:btn $dir }
+}
+
+# ---------- navegacao: voltar, alternador de apps, abrir app pelo Spotlight ----------
+# voltar = toque no "<" do canto superior esquerdo. O swipe da borda esquerda NAO voltou no WhatsApp com o ponteiro
+# do AssistiveTouch (teste 2026-11-10), por isso e toque. 'voltar x y' usa outra posicao so dessa vez.
+function DoBack([double]$u = $BackX, [double]$v = $BackY) {
+    if (-not (Ready)) { return 'NAO ENVIADO: iPhone sem inscricao' }
+    $r = DoTap $u $v
+    if ($r -eq 'ok') { return ('ok toque em {0:0.000} {1:0.000} (botao "<"; se nao voltou: voltar x y, ou -BackX/-BackY)' -f $u, $v) }
+    $r
+}
+# alternador de apps = deslizar da base ate o meio e segurar parado antes de soltar
+function DoAppSwitcher { DoSwipe 0.5 0.995 0.5 0.6 300 600 }
+# abrir <app>: Home primeiro (se o Spotlight nao abrir, o texto nao cai numa conversa), Cmd+Espaco, digita, Enter.
+function OpenApp([string]$name) {
+    if (-not (Ready)) { return 'NAO ENVIADO: iPhone sem inscricao' }
+    $name = ($name -replace '[\r\n]+', ' ').Trim()
+    if ($name -eq '') { return 'ERRO: use abrir <nome do app>, ex.: abrir whatsapp' }
+    $null = ConsumerTap 0x0040; Start-Sleep -Milliseconds 700          # tela inicial
+    $null = Tap $GUI 0x2C; Start-Sleep -Milliseconds 700              # Cmd+Espaco = Spotlight
+    $r = SendText $name
+    if ($r -notlike 'ok*') { return "parou antes do Enter: $r" }
+    Start-Sleep -Milliseconds 900                                       # resultados do Spotlight
+    $null = Tap 0 0x28                                                  # Enter abre o 1o resultado
+    "ok Home + Cmd+Espaco + '$name' + Enter (se nao abriu: o Spotlight nao abriu ou o 1o resultado era outro)"
+}
+
+# ---------- respostas prontas: respostas.txt (nome = texto), uma por linha; nunca aperta Enter ----------
+$respFile = Join-Path $here 'respostas.txt'
+$respExample = Join-Path $here 'respostas.exemplo.txt'
+function ParseRespostas([string[]]$lines) {
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($ln in $lines) {
+        $t = ([string]$ln).Trim()
+        if ($t -eq '' -or $t.StartsWith('#')) { continue }
+        $p = $t.IndexOf('='); if ($p -le 0) { continue }
+        $nome = $t.Substring(0, $p).Trim().ToLower(); $texto = $t.Substring($p + 1).Trim()
+        if ($nome -ne '' -and $texto -ne '') { $out.Add([pscustomobject]@{ Nome = $nome; Texto = $texto }) }
+    }
+    , $out
+}
+function LoadRespostas {
+    # respostas.txt e seu (fica fora do git); na primeira vez copia o exemplo
+    if (-not (Test-Path -LiteralPath $respFile) -and (Test-Path -LiteralPath $respExample)) { try { Copy-Item -LiteralPath $respExample -Destination $respFile } catch {} }
+    if (-not (Test-Path -LiteralPath $respFile)) { return , (New-Object System.Collections.Generic.List[object]) }
+    ParseRespostas @(Get-Content -LiteralPath $respFile -Encoding UTF8)
+}
+function ListRespostas {
+    $rs = LoadRespostas
+    if ($rs.Count -eq 0) { return "nenhuma resposta em $respFile (formato: nome = texto)" }
+    $i = 0; ($rs | ForEach-Object { $i++; $prev = if ($_.Texto.Length -gt 30) { $_.Texto.Substring(0, 30) + '...' } else { $_.Texto }; $(if ($i -le 9) { "Ctrl+Shift+$i " } else { '' }) + "/r $($_.Nome) = $prev" }) -join ' | '
+}
+function SendResposta($r) {
+    $t = [IPC]::NormalizePaste($r.Texto) -replace '[\r\n]+', ' '      # sem quebra de linha: nunca vira Enter
+    (SendText $t) + " (resposta '$($r.Nome)', sem Enter)"
+}
+function ReplyByName([string]$name) {
+    $name = $name.Trim().ToLower()
+    if ($name -eq '') { return ListRespostas }
+    $rs = LoadRespostas
+    $r = $rs | Where-Object { $_.Nome -eq $name } | Select-Object -First 1
+    if (-not $r) { return "ERRO: resposta '$name' nao existe em respostas.txt (/r lista)" }
+    SendResposta $r
+}
+function ReplyByIndex([int]$n) {
+    $rs = LoadRespostas
+    if ($n -lt 1 -or $n -gt $rs.Count) { return "ERRO: nao ha resposta $n em respostas.txt ($($rs.Count) resposta(s))" }
+    SendResposta $rs[$n - 1]
+}
+
+# ---------- sugerir.ps1: processo separado, sem travar o loop ----------
+function StartSugerir {
+    $p = Join-Path $here 'sugerir.ps1'
+    if (-not (Test-Path -LiteralPath $p)) { return 'sugerir.ps1 nao encontrado' }
+    try {
+        $pr = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$p`"") -PassThru
+        "ok sugerir.ps1 iniciado em segundo plano (PID $($pr.Id))"
+    } catch { "ERRO ao iniciar sugerir.ps1: $($_.Exception.Message)" }
+}
+
+# ---------- proporcao do video salva (.tmp\proporcao.txt, so local) ----------
+# O iPhone tem uma proporcao fixa: retrato = a, paisagem = 1/a. Guardar a confirmada evita comecar "cheia"
+# e deixa a leitura com faixas pretas (que oscila 0,4617..0,4629) cair exatamente no valor salvo.
+$aspectFile = Join-Path $tmpDir 'proporcao.txt'
+$script:savedAspect = 0.0; $script:aspectCand = 0.0
+function LoadSavedAspect {
+    try { $t = (Get-Content -LiteralPath $aspectFile -ErrorAction Stop | Select-Object -First 1).Trim(); $x = N $t; if ($x -gt 0.3 -and $x -lt 0.9) { return $x } } catch {}
+    0.0
+}
+# Pura: leitura -> proporcao retrato equivalente (0 = sem faixas / desconhecida)
+function PortraitOf([double]$a) { if ($a -le 0) { 0.0 } elseif ($a -lt 1) { $a } else { 1.0 / $a } }
+# Pura: se a leitura bate (5%) com a salva (retrato ou paisagem), devolve o valor salvo exato; senao a propria leitura
+function SnapAspect([double]$a, [double]$saved) {
+    if ($a -le 0 -or $saved -le 0) { return $a }
+    $exp = if ($a -lt 1) { $saved } else { 1.0 / $saved }
+    if ([Math]::Abs($a - $exp) / $exp -lt 0.05) { $exp } else { $a }
+}
+# Grava so quando duas leituras com faixas seguidas concordam (1%): uma tela escura sozinha nao estraga o valor salvo.
+function NoteAspect([double]$a) {
+    $pa = PortraitOf $a
+    if ($pa -le 0.3 -or $pa -ge 0.9) { return }
+    if ($script:aspectCand -gt 0 -and [Math]::Abs($pa - $script:aspectCand) / $script:aspectCand -lt 0.01) {
+        if ($script:savedAspect -le 0 -or [Math]::Abs($pa - $script:savedAspect) / $script:savedAspect -gt 0.005) {
+            try { New-Item -ItemType Directory -Force $tmpDir | Out-Null; Set-Content -LiteralPath $aspectFile -Value ($pa.ToString('0.0000', [Globalization.CultureInfo]::InvariantCulture)) -Encoding ASCII; $script:savedAspect = $pa; Log ("Proporcao salva: {0:0.0000} (retrato)" -f $pa) 'Cyan' } catch {}
+        }
+    }
+    $script:aspectCand = $pa
 }
 
 # ======================================================================================================
@@ -1247,6 +1414,12 @@ function HandleCommand([string]$line) {
                 if (-not (Ready)) { return 'NAO ENVIADO: iPhone sem inscricao' }; return (DoScrollSwipe $d $u $v) }
             'home' { if (-not (Ready)) { return 'NAO ENVIADO: iPhone sem inscricao' }; $null = ConsumerTap 0x0040; return 'ok (consumer 0x0040; se nao voltar pra tela inicial use: homeswipe)' }
             'homeswipe' { return (DoSwipe 0.5 0.995 0.5 0.55 250) }
+            'voltar' { if ($a.Count -ge 2) { return (DoBack (N $a[0]) (N $a[1])) }; return (DoBack) }
+            'apps' { return (DoAppSwitcher) }
+            'abrir' { return (OpenApp $rest) }
+            { $_ -in '/r', 'r', 'resposta' } { return (ReplyByName $rest) }
+            'respostas' { return (ListRespostas) }
+            'sugerir' { return (StartSugerir) }
             'paste' { return (DoPaste) }
             'zero' { if (-not $Relative) { return 'so no modo relativo' }; RelZero; return 'ok cursor no canto superior esquerdo' }
             'relmove' { if (-not $Relative) { return 'so no modo relativo' }; $dx = [int]$a[0]; $dy = [int]$a[1]
@@ -1269,8 +1442,8 @@ function HandleCommand([string]$line) {
                 return ([IPC]::FitNow($true)) }
             'on' { [IPC]::Enabled = $true; return 'captura ligada' }
             'off' { [IPC]::Enabled = $false; return 'captura desligada' }
-            'status' { return "modo=$(if ($Relative) { 'relativo' } else { 'absoluto' }) captura=$(if ([IPC]::Enabled) { 'on' } else { 'off' }) $($script:lastSubs) | $([IPC]::Describe()) | hooks: $([IPC]::HookStatus) | anuncio: $($script:provider.AdvertisementStatus) | $(NotifyStats) | KeyDelayMs=$KeyDelayMs | topo=$(if ([IPC]::MirrorTopmost) { 'on' } else { 'off' }) | afixar=$(if ([IPC]::AutoFit) { 'on' } else { 'off' }) ($([IPC]::FitStatus)) | indicador: $([IPC]::OverlayStatus)$(BeaconWarn)" }
-            'help' { return 'type <texto> | key enter|backspace|tab|esc|space|delete|up|down|left|right|cmd+a [n] | tap x y | longpress x y [ms] | swipe x1 y1 x2 y2 [ms] | scroll n [x y] | home | homeswipe | paste (clipboard do PC; Esc cancela) | clip (mostra o clipboard sem digitar) | screenshot [nome.png em .tmp] | calibrate | fit [on|off|plan] | on | off | status   (x,y de 0 a 1 na area de video)' }
+            'status' { return "modo=$(if ($Relative) { 'relativo' } else { 'absoluto' }) captura=$(if ([IPC]::Enabled) { 'on' } else { 'off' }) $($script:lastSubs) | $([IPC]::Describe()) | hooks: $([IPC]::HookStatus) | anuncio: $($script:provider.AdvertisementStatus) | $(NotifyStats) | KeyDelayMs=$KeyDelayMs | topo=$(if ([IPC]::MirrorTopmost) { 'on' } else { 'off' }) | afixar=$(if ([IPC]::AutoFit) { 'on' } else { 'off' }) ($([IPC]::FitStatus)) | indicador: $([IPC]::OverlayStatus) | proporcao salva: $(if ($script:savedAspect -gt 0) { '{0:0.0000}' -f $script:savedAspect } else { 'nenhuma' }) | voltar em $BackX $BackY$(BeaconWarn)" }
+            'help' { return 'type <texto> | key enter|backspace|tab|esc|space|delete|up|down|left|right|cmd+a [n] | tap x y | longpress x y [ms] | swipe x1 y1 x2 y2 [ms] | scroll n [x y] | home | homeswipe | voltar [x y] | apps | abrir <app> | /r [nome] (resposta pronta, sem Enter) | respostas | sugerir | paste (clipboard do PC; Esc cancela) | clip (mostra o clipboard sem digitar) | screenshot [nome.png em .tmp] | calibrate | fit [on|off|plan] | on | off | status   (x,y de 0 a 1 na area de video)' }
         }
     } catch { return "ERRO: $($_.Exception.Message)" }
     "ERRO: comando desconhecido '$cmd' (help)"
@@ -1291,6 +1464,9 @@ function ProcessHookEvents {
         if ($p[0] -eq 'topmost') { Log "Espelho sempre no topo: $($p[1]) (Ctrl+Shift+F11)" 'Cyan'; continue }
         if ($p[0] -eq 'fit') { Log "Afixar na altura da tela: $($p[1]) (Ctrl+Shift+F10)" 'Cyan'; continue }
         if ($p[0] -eq 'fitlog') { Log $e.Substring(7) 'Cyan'; continue }
+        if ($p[0] -eq 'wheeldiag') { Log $e.Substring(10) $(if ($e -like '*IGNORADA*') { 'Yellow' } else { 'DarkGray' }); continue }
+        if ($p[0] -eq 'stuck') { Log "Dedo preso solto: $($e.Substring(6))" 'Yellow'; continue }
+        if ($p[0] -eq 'suggest') { Log "Ctrl+Shift+S -> $(StartSugerir)" 'Cyan'; continue }
         if (-not (Ready)) {
             if (((Get-Date) - $script:lastWarn).TotalSeconds -gt 3) { $script:lastWarn = Get-Date; Log 'Evento ignorado: iPhone sem inscricao (pareado e conectado?)' 'Yellow' }
             continue
@@ -1317,6 +1493,8 @@ function ProcessHookEvents {
             'key' { $null = Tap ([byte][int]$p[2]) ([byte][int]$p[1]) }
             'text' { foreach ($c in $e.Substring(5).ToCharArray()) { if (-not (TypeChar $c)) { Log "Sem mapa para '$c'" 'Yellow' } } }
             'paste' { $r = DoPaste; Log "Ctrl+V -> $r" $(if ($r -like 'ok*') { 'Gray' } else { 'Yellow' }) }
+            'back' { $r = DoBack; Log "Esc -> voltar: $r" $(if ($r -like 'ok*') { 'Gray' } else { 'Yellow' }) }
+            'reply' { $r = ReplyByIndex ([int]$p[1]); Log "Ctrl+Shift+$($p[1]) -> $r" $(if ($r -like 'ok*') { 'Gray' } else { 'Yellow' }) }
         }
     }
     $true
@@ -1332,13 +1510,18 @@ function CheckWindow {
     if ($VideoAspect -gt 0 -or $d -notlike 'cliente*') { return }
     if (-not $script:aspectDone) {
         $r = [IPC]::DetectAspect()
-        if ($r -like 'ok*') { $script:aspectDone = $true; Log "Area de video: $r | $([IPC]::Describe())" 'Cyan'; [IPC]::AspectChanged() }
+        if ($r -like 'ok*') {
+            $raw = [IPC]::VideoAspect; NoteAspect $raw; [IPC]::VideoAspect = SnapAspect $raw $script:savedAspect
+            $script:aspectDone = $true; Log "Area de video: $r | $([IPC]::Describe())" 'Cyan'; [IPC]::AspectChanged()
+        }
         return
     }
     $na = 0.0; $info = ''
-    if ([IPC]::PeekAspect([ref]$na, [ref]$info) -and (([IPC]::EffectiveAspect($na) -lt 1) -ne ([IPC]::EffectiveAspect([IPC]::VideoAspect) -lt 1))) {
+    $peek = [IPC]::PeekAspect([ref]$na, [ref]$info)
+    if ($peek -and $na -gt 0) { NoteAspect $na }
+    if ($peek -and (([IPC]::EffectiveAspect($na) -lt 1) -ne ([IPC]::EffectiveAspect([IPC]::VideoAspect) -lt 1))) {
         $script:flipCount++                                    # 2 leituras seguidas antes de aceitar (tela escura engana)
-        if ($script:flipCount -ge 2) { [IPC]::VideoAspect = $na; $script:flipCount = 0; Log "Video girou: $info | $([IPC]::Describe())" 'Cyan'; [IPC]::AspectChanged() }
+        if ($script:flipCount -ge 2) { [IPC]::VideoAspect = SnapAspect $na $script:savedAspect; $script:flipCount = 0; Log "Video girou: $info | $([IPC]::Describe())" 'Cyan'; [IPC]::AspectChanged() }
     } else { $script:flipCount = 0 }
 }
 
@@ -1369,6 +1552,13 @@ if ($SelfTest -or $SelfTestAdvertise) {
     $hb = [Text.Encoding]::UTF8.GetBytes("Version:0.9`r`nStartHTML:-1`r`nEndHTML:-1`r`nStartFragment:0000000000`r`nEndFragment:0000000000`r`n<html><body><!--StartFragment--><p>Ol&aacute; <b>mundo</b>&nbsp;&amp; cia</p><!--EndFragment--></body></html>")
     $ht = [IPC]::HtmlToText($hb)
     Check 'HTML Format -> texto' ($ht -ceq "Ol$(& $C 0xE1) mundo$(& $C 0xA0)& cia") "('$ht')"
+
+    # 1c. respostas prontas e proporcao salva (funcoes puras)
+    $rs = ParseRespostas @('# comentario', '', 'ok = Combinado, ja te retorno', 'Endereco=Rua Exemplo, 123 = fundos', 'sem igual', '=sem nome', 'vazio =')
+    Check 'Respostas: le nome = texto (ignora comentario, vazio, sem nome)' ($rs.Count -eq 2 -and $rs[0].Nome -eq 'ok' -and $rs[0].Texto -eq 'Combinado, ja te retorno' -and $rs[1].Nome -eq 'endereco' -and $rs[1].Texto -eq 'Rua Exemplo, 123 = fundos') "($($rs.Count) respostas)"
+    if (Test-Path -LiteralPath $respExample) { $ex = ParseRespostas @(Get-Content -LiteralPath $respExample -Encoding UTF8); Check 'respostas.exemplo.txt le sem erro' ($ex.Count -ge 1) "($($ex.Count) respostas)" }
+    Check 'Proporcao: leitura perto da salva vira a salva (retrato e paisagem)' ((SnapAspect 0.4629 0.4617) -eq 0.4617 -and [Math]::Abs((SnapAspect 2.17 0.4617) - 1 / 0.4617) -lt 1e-9) "($(SnapAspect 0.4629 0.4617), $(SnapAspect 2.17 0.4617))"
+    Check 'Proporcao: leitura longe da salva fica como veio' ((SnapAspect 0.75 0.4617) -eq 0.75 -and (SnapAspect 0 0.4617) -eq 0 -and (PortraitOf 2.0) -eq 0.5) ''
 
     # 2. conta da area de video
     $q = [IPC]::ComputeVideoRect(489, 990, 0.4618)
@@ -1480,7 +1670,11 @@ Write-Host ""
 Write-Host "=== Pronto. iPhone: Ajustes > Bluetooth > $env:COMPUTERNAME | AssistiveTouch ligado ===" -ForegroundColor Cyan
 Write-Host "Clique na janela '$WindowTitle' = toque | janela em foco = teclado vai pro iPhone | Ctrl+Shift+F12 liga/desliga"
 Write-Host "Ctrl+Shift+F11 = espelho sempre no topo | Ctrl+Shift+F10 = afixar na altura da tela | Esc cancela um colar longo | console: 'clip' mostra o clipboard sem digitar"
+Write-Host "Esc = voltar | Ctrl+Shift+1..9 = resposta pronta (respostas.txt, sem Enter) | Ctrl+Shift+S = sugerir | console: abrir <app>, /r <nome>, apps"
 Write-Host "Console: texto solto = digitar | help = comandos | q = sair"
+$script:savedAspect = LoadSavedAspect
+if ($VideoAspect -le 0 -and $script:savedAspect -gt 0) { [IPC]::VideoAspect = $script:savedAspect; Log ("Proporcao salva carregada: {0:0.0000} (a deteccao confere quando a janela aparecer)" -f $script:savedAspect) 'Cyan' }
+$script:btnSince = $null
 PollState; CheckWindow
 $script:promptShown = $true; ShowPrompt
 $lastPoll = Get-Date
@@ -1496,7 +1690,7 @@ try {
                 if ($line -eq 'q') { break }
                 if ($line -ne '') {
                     $first = ($line -split '\s+')[0].ToLower()
-                    if (@('type', 'key', 'tap', 'longpress', 'swipe', 'scroll', 'home', 'homeswipe', 'paste', 'clip', 'zero', 'relmove', 'screenshot', 'calibrate', 'fit', 'on', 'off', 'status', 'help') -contains $first) { $r = HandleCommand $line }
+                    if (@('type', 'key', 'tap', 'longpress', 'swipe', 'scroll', 'home', 'homeswipe', 'voltar', 'apps', 'abrir', '/r', 'respostas', 'sugerir', 'paste', 'clip', 'zero', 'relmove', 'screenshot', 'calibrate', 'fit', 'on', 'off', 'status', 'help') -contains $first) { $r = HandleCommand $line }
                     elseif ($line -eq '/enter') { $r = SendKeyCombo 'enter' }
                     elseif ($line -match '^/apaga\s*(\d*)$') { $r = SendKeyCombo 'backspace' $(if ($Matches[1]) { [int]$Matches[1] } else { 1 }) }
                     else { $r = SendText $line }
@@ -1515,7 +1709,14 @@ try {
             $req.Resp = HandleCommand $req.Cmd; $req.Done.Set()
             Log "[canal] $($req.Cmd) -> $($req.Resp)" 'DarkGray'
         }
-        if (((Get-Date) - $lastPoll).TotalSeconds -ge 2) { $lastPoll = Get-Date; PollState; CheckWindow }
+        if (((Get-Date) - $lastPoll).TotalSeconds -ge 2) {
+            $lastPoll = Get-Date; PollState; CheckWindow
+            # lado PowerShell do "dedo preso": botao apertado no iPhone, sem arraste no hook e sem evento na fila (2 polls seguidos)
+            if ($script:btn -eq 1 -and -not [IPC]::Dragging -and [IPC]::Events.IsEmpty) {
+                if ($null -eq $script:btnSince) { $script:btnSince = Get-Date }
+                elseif (Ready) { PointerUp; $script:btnSince = $null; Log 'Dedo preso solto: botao ficou apertado sem arraste no PC' 'Yellow' }
+            } else { $script:btnSince = $null }
+        }
         if (-not $busy) { $null = [IPC]::Wake.WaitOne(5) }   # acorda na hora com clique/tecla/canal
     }
 } finally {

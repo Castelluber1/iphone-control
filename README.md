@@ -66,6 +66,9 @@ Com o script rodando e a tela espelhada:
 | **Ctrl+Shift+F11** | Liga/desliga "sempre no topo" na janela do espelho |
 | **Ctrl+Shift+F10** | Liga/desliga "afixar na altura da tela" |
 | **Esc** durante um Ctrl+V longo | Cancela a digitação |
+| **Esc** (fora de um colar) | Voltar: toca no botão "<" do canto superior esquerdo |
+| **Ctrl+Shift+1** a **9** | Digita a resposta pronta 1 a 9 do `respostas.txt` (nunca aperta Enter) |
+| **Ctrl+Shift+S** | Abre o `sugerir.ps1` em segundo plano (sugestão de resposta, ver [SUGERIR.md](SUGERIR.md)) |
 
 Um selo **CONTROLE LIGADO / DESLIGADO** aparece na barra de título do espelho.
 
@@ -74,6 +77,19 @@ Um selo **CONTROLE LIGADO / DESLIGADO** aparece na barra de título do espelho.
 O primeiro clique numa janela sem foco só dá foco a ela (e também conta como toque).
 
 No console do script dá para digitar comandos (`help` lista todos): texto solto digita no iPhone, `tap 0.5 0.5`, `swipe ...`, `home`, `status`, `q` para sair.
+
+Atalhos de navegação (console e canal local):
+
+- `abrir whatsapp` — vai para a tela inicial, abre a busca (Cmd+Espaço), digita o nome e aperta Enter no primeiro resultado. Teste primeiro com a tela inicial aberta: se a busca não abrir no seu iPhone, o nome é digitado onde estiver o cursor.
+- `voltar` — toca no "<" do canto superior esquerdo (mesmo que o Esc). A posição muda de app para app: `voltar 0.06 0.08` usa outra posição só dessa vez, e `-BackX` / `-BackY` muda o padrão. O deslize da borda esquerda não funciona com o ponteiro do AssistiveTouch.
+- `apps` — alternador de apps (desliza da base até o meio e segura).
+- `sugerir` — o mesmo que Ctrl+Shift+S.
+
+**Respostas prontas:** na primeira vez o script cria o `respostas.txt` a partir do `respostas.exemplo.txt`. Uma resposta por linha, `nome = texto`. No console, `/r` lista as respostas e `/r nome` digita uma; com o espelho em foco, Ctrl+Shift+1..9 digita a 1ª..9ª da lista. O texto é só digitado; quem confere e aperta Enter é você. O arquivo é lido de novo a cada uso (pode editar com o script aberto) e fica fora do git.
+
+**Proporção do vídeo:** a proporção confirmada do iPhone fica salva em `.tmp\proporcao.txt` e é usada logo ao abrir, antes da detecção. A detecção por faixas pretas continua rodando e manda; quando a leitura chega perto do valor salvo (retrato ou paisagem), usa o salvo exato.
+
+**Dedo preso:** se o "soltar" do clique se perder (Win+L, UAC, troca de janela no meio de um arraste), o script solta o dedo no iPhone sozinho e avisa no console.
 
 Opções úteis:
 
@@ -97,6 +113,7 @@ Coordenadas vão de 0 a 1 dentro da área do vídeo (0 0 = canto superior esquer
 ## Problemas comuns
 
 - **Pareou mas não mexe / mudou de versão do script:** o iOS guarda a descrição antiga do aparelho. No iPhone, **Ajustes > Bluetooth > (i) ao lado do PC > Esquecer Este Dispositivo**, e pareie de novo.
+- **Rodinha não rola:** a cada rajada da rodinha o console mostra uma linha `Rodinha: ...` dizendo se foi para o iPhone ou por que foi ignorada (captura desligada, fora da área de vídeo, outra janela por cima).
 - **Imagem estragada, congelada ou toque caindo no lugar errado:** pare o espelhamento no iPhone e espelhe de novo. Se o toque continuar deslocado, rode `calibrate` no console.
 - **Bolinha do AssistiveTouch atrapalhando a tela:** em **Ajustes > Acessibilidade > Toque > AssistiveTouch**, baixe a **Opacidade em Repouso**.
 - **iPhone não acha o uxplay-windows:** quase sempre é firewall ou rede marcada como Pública. Confira a regra do `uxplay.exe` em rede Privada.

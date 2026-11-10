@@ -1,0 +1,8 @@
+# Respostas prontas do iphone-control: uma por linha, no formato  nome = texto
+# Use no console ou pelo canal com  /r nome  (ex.: /r ok). Com o espelho em foco, Ctrl+Shift+1..9
+# digita a 1a..9a resposta desta lista, na ordem. Nunca aperta Enter: voce confere e envia.
+# Linhas com # sao comentario. Edite o seu respostas.txt (fica fora do git); este e so o exemplo.
+ok = Combinado, já te retorno.
+depois = Agora não consigo falar, te chamo mais tarde.
+obrigado = Muito obrigado!
+chegando = Estou chegando, uns 10 minutos.
