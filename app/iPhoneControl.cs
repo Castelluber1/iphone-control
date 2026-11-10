@@ -334,6 +334,8 @@ class MainForm : Form {
     Toggle tCap, tTop;
     Field fApp;
     ContextMenuStrip respMenu, trayMenu;
+    Tile[] respTiles = new Tile[4];
+    int respTop;
     NotifyIcon tray;
     System.Windows.Forms.Timer poll = new System.Windows.Forms.Timer(), toastTimer = new System.Windows.Forms.Timer();
     Icon appIcon;
@@ -421,10 +423,22 @@ class MainForm : Form {
         bOpen.Primary = true; bOpen.Click += delegate { OpenApp(); };
         y += 22 + 38 + 18;   // 264
         int hw = (W - 2 * m - 8) / 2;
-        bSugerir = MkTile("", "Sugerir", false, P(m), P(y + 22), P(hw), P(42), "sugerir");
-        bResp = MkTile("", "Respostas", false, P(m + hw + 8), P(y + 22), P(W - 2 * m - hw - 8), P(42), null);
+        bSugerir = MkTile("", "Sugerir resposta", false, P(m), P(y + 22), P(W - 2 * m), P(42), "sugerir");
+        y += 22 + 42 + 18;
+        // RESPOSTAS: as 4 primeiras do respostas.txt expostas, o resto em "Outros"
+        respTop = y;
+        for (int k = 0; k < 4; k++) {
+            int cx = m + (k % 2) * (hw + 8), cy = y + 22 + (k / 2) * (40 + 8);
+            int idx = k;
+            Tile rt = MkTile("", "", false, P(cx), P(cy), P(k % 2 == 0 ? hw : W - 2 * m - hw - 8), P(40), null);
+            rt.Click += delegate { SendRespostaAt(idx, rt); };
+            respTiles[k] = rt;
+        }
+        y += 22 + 2 * 40 + 8 + 8;
+        bResp = MkTile("", "Outras respostas", false, P(m), P(y), P(W - 2 * m), P(40), null);
         bResp.Chevron = true; bResp.Click += delegate { ShowRespostas(); };
-        y += 22 + 42 + 8;    // 336
+        RefreshRespTiles();
+        y += 40 + 18;
         tCap = MkToggle("", "Captura do mouse e teclado", P(m), P(y), P(W - 2 * m), P(44));
         tCap.Toggled += delegate { ignoreTogglesUntil = Environment.TickCount + 2500; Send(tCap.On ? "on" : "off", null); };
         y += 44 + 6;
@@ -628,29 +642,52 @@ class MainForm : Form {
         Send("abrir " + n, bOpen);
         fApp.Box.SelectAll();
     }
-    void ShowRespostas() {
-        respMenu.Items.Clear();
+    List<KeyValuePair<string, string>> LoadResp() {
+        List<KeyValuePair<string, string>> r = new List<KeyValuePair<string, string>>();
         string f = Path.Combine(root, "respostas.txt");
         if (!File.Exists(f)) f = Path.Combine(root, "respostas.exemplo.txt");
-        int i = 0;
         try {
             foreach (string raw in File.ReadAllLines(f, Encoding.UTF8)) {
                 string t = raw.Trim(); if (t == "" || t.StartsWith("#")) continue;
                 int p = t.IndexOf('='); if (p <= 0) continue;
                 string nome = t.Substring(0, p).Trim().ToLowerInvariant(), texto = t.Substring(p + 1).Trim();
-                if (nome == "" || texto == "") continue;
-                i++;
-                string prev = texto.Length > 42 ? texto.Substring(0, 42) + "…" : texto;
-                string cmd = "/r " + nome;
-                ToolStripMenuItem it = new ToolStripMenuItem(nome + "   ·   " + prev);
-                if (i <= 9) it.ShortcutKeyDisplayString = "Ctrl+Shift+" + i;
-                it.Click += delegate { Send(cmd, bResp); };
-                respMenu.Items.Add(it);
+                if (nome != "" && texto != "") r.Add(new KeyValuePair<string, string>(nome, texto));
             }
         } catch (Exception) { }
-        if (i == 0) { ToolStripMenuItem none = new ToolStripMenuItem("Nenhuma resposta em respostas.txt"); none.Enabled = false; respMenu.Items.Add(none); }
+        return r;
+    }
+    static string Rotulo(string nome) { return nome.Length == 0 ? nome : char.ToUpper(nome[0]) + nome.Substring(1); }
+    void RefreshRespTiles() {
+        List<KeyValuePair<string, string>> rs = LoadResp();
+        for (int k = 0; k < 4; k++) {
+            Tile t = respTiles[k]; if (t == null) continue;
+            bool has = k < rs.Count;
+            string lbl = has ? Rotulo(rs[k].Key) : "(vazio)";
+            if (lbl.Length > 15) lbl = lbl.Substring(0, 14).TrimEnd() + "…";
+            t.Label = lbl; t.Text = lbl; t.AccessibleName = lbl; t.Enabled = has; t.Invalidate();
+        }
+    }
+    void SendRespostaAt(int k, Tile t) {
+        List<KeyValuePair<string, string>> rs = LoadResp();
+        RefreshRespTiles();
+        if (k < rs.Count) Send("/r " + rs[k].Key, t);
+    }
+    void ShowRespostas() {
+        respMenu.Items.Clear();
+        List<KeyValuePair<string, string>> rs = LoadResp();
+        RefreshRespTiles();
+        int n = 0;
+        for (int i = 4; i < rs.Count; i++) {
+            string texto = rs[i].Value, prev = texto.Length > 42 ? texto.Substring(0, 42) + "\u2026" : texto;
+            string cmd = "/r " + rs[i].Key;
+            ToolStripMenuItem it = new ToolStripMenuItem(Rotulo(rs[i].Key) + "   \u00b7   " + prev);
+            if (i < 9) it.ShortcutKeyDisplayString = "Ctrl+Shift+" + (i + 1);
+            it.Click += delegate { Send(cmd, bResp); };
+            respMenu.Items.Add(it); n++;
+        }
+        if (n == 0) { ToolStripMenuItem none = new ToolStripMenuItem("Nenhuma outra resposta em respostas.txt"); none.Enabled = false; respMenu.Items.Add(none); }
         respMenu.Items.Add(new ToolStripSeparator());
-        respMenu.Items.Add("Editar respostas…", null, delegate { EditRespostas(); });
+        respMenu.Items.Add("Editar respostas\u2026", null, delegate { EditRespostas(); });
         respMenu.Show(bResp, new Point(0, bResp.Height + P(4)));
     }
     void EditRespostas() {
@@ -706,6 +743,7 @@ class MainForm : Form {
         Section(g, "NAVEGAÇÃO", bBack.Top - P(20));
         Section(g, "ABRIR APP", fApp.Top - P(20));
         Section(g, "FERRAMENTAS", bSugerir.Top - P(20));
+        Section(g, "RESPOSTAS", respTiles[0].Top - P(20));
         // rodape: feedback breve
         if (toast != "" && toastAlpha > 0) {
             Color c = Theme.Mix(T.Bg, toastOk ? T.OkFg : T.BadFg, toastAlpha);

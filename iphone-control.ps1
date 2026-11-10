@@ -290,10 +290,12 @@ public static class IPC {
         if (!Enabled) why = "captura desligada";
         else if (dragging) why = "arrastando";
         else if (h == IntPtr.Zero) why = "janela '" + Title + "' nao encontrada";
-        else if (!VideoRect(h, out v) || !Inside(v, m.pt)) why = "fora da area de video";
+        else if (!VideoRect(h, out v)) why = "area de video desconhecida";
         else {
+            // basta o cursor estar sobre a janela do espelho: a conta de "dentro do video" falhava (log: "fora da area de video")
+            // com o cursor em cima do espelho; a posicao do swipe e limitada a faixa segura depois
             IntPtr under = GetAncestor(WindowFromPoint(m.pt), 2);
-            if (under != h && under != chipHwnd) why = "outra janela por cima do espelho (" + ProcOf(under) + ")";
+            if (under != h && under != chipHwnd) why = "cursor fora do espelho (" + ProcOf(under) + ")";
         }
         if (newBurst) Push("wheeldiag Rodinha: delta " + delta + (injected ? " (injetada)" : "") + (why == null ? " -> rola o iPhone" : " -> IGNORADA: " + why) + " | iPhone inscrito=" + (Connected ? "sim" : "nao"));
         if (why != null) { lastWheelTick = now; return CallNextHookEx(IntPtr.Zero, code, w, l); }

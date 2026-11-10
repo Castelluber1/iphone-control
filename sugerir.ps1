@@ -7,7 +7,9 @@
 #   ... -Instrucao "mais formal"
 #   ... -Image C:\caminho\print.png      (usa um print pronto em vez de pedir ao canal local)
 #   ... -CodexPath C:\...\codex.exe      (ou variavel de ambiente CODEX_PATH)
-#   ... -SemJanela                       (so clipboard, sem janelas)
+#   ... -SemJanela                       (so clipboard, sem janelas e sem digitar)
+#   ... -Janela                          (janela editavel em vez de digitar direto)
+#   Padrao: toca no campo do WhatsApp e digita a sugestao, SEM Enter.
 #
 # Privacidade: o print vai para os servidores da OpenAI. Ver SUGERIR.md.
 
@@ -18,8 +20,13 @@ param(
     [int]$TimeoutSec = 120,
     [int]$Port = 47380,
     [switch]$SemJanela,
+    [switch]$Janela,          # modo antigo: janela editavel em vez de digitar direto no WhatsApp
+    [double]$CampoX = 0.45, [double]$CampoY = 0.935,   # campo de mensagem do WhatsApp (retrato)
     [int]$AutoFecharSeg = 0
 )
+# padrao: digita a sugestao direto no campo do WhatsApp (sem Enter) e nao abre janela nenhuma
+$Digitar = -not $Janela -and -not $SemJanela
+if ($Digitar) { $SemJanela = $true }
 
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -251,6 +258,22 @@ $clipOk = Set-Clip $sugestao
 Log "OK origem=$origem t=${secs}s chars=$($sugestao.Length) instrucao=$([bool]($Instrucao.Trim() -ne '')) contexto=$(Test-Path $ctxFile) clipboard=$clipOk"
 Say ("Sugestao pronta em {0} s{1}." -f $secs, $(if ($clipOk) { ' e copiada (Ctrl+V no campo do WhatsApp)' } else { '' })) 'Green'
 
+if ($Digitar) {
+    # toca no campo de mensagem e digita; NUNCA aperta Enter: quem envia e voce
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $texto = ($sugestao -replace '\s*\r?\n\s*', ' ').Trim()
+    try {
+        $wc = New-Object System.Net.WebClient
+        $wc.Proxy = $null; $wc.Encoding = [Text.Encoding]::UTF8
+        $wc.Headers.Add('X-iPhone-Control', '1'); $wc.Headers.Add('Content-Type', 'text/plain; charset=utf-8')
+        $null = $wc.UploadString("http://127.0.0.1:$Port/", 'POST', ('tap {0} {1}' -f $CampoX.ToString($inv), $CampoY.ToString($inv)))
+        Start-Sleep -Milliseconds 400
+        $wc.Headers.Add('X-iPhone-Control', '1'); $wc.Headers.Add('Content-Type', 'text/plain; charset=utf-8')
+        $r = $wc.UploadString("http://127.0.0.1:$Port/", 'POST', "type $texto")
+        Log "DIGITADO $r"
+    } catch { Fail "Sugestao pronta (esta no clipboard), mas nao consegui digitar no iPhone: $($_.Exception.Message)" }
+    exit 0
+}
 if ($SemJanela) { exit 0 }
 
 $form = New-Object System.Windows.Forms.Form
