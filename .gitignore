@@ -1,0 +1,10 @@
+# logs (contem texto digitado e enderecos Bluetooth)
+logs/
+*.log
+
+# temporarios e screenshots
+.tmp/
+*.png
+
+# backups locais das versoes que funcionaram
+*.v*-ok.ps1
