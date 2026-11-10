@@ -7,7 +7,7 @@ Como funciona:
 - **Imagem:** o [uxplay-windows](https://github.com/leapbtw/uxplay-windows) recebe o "Espelhar Tela" do iPhone pelo Wi-Fi e abre a janela **AirPlay Video Stream**.
 - **Controle:** o script `iphone-control.ps1` faz o PC se apresentar ao iPhone como um **teclado + mouse Bluetooth LE** (HID). Clique na janela do espelho vira toque no iPhone; o teclado do PC digita no iPhone.
 
-Não instala nada além do uxplay-windows: o script usa só o PowerShell 5.1 que já vem no Windows.
+Não instala nada além do uxplay-windows: usa só o PowerShell 5.1 e o compilador C# do .NET Framework 4, que já vêm no Windows.
 
 ## Requisitos
 
@@ -27,8 +27,21 @@ Não instala nada além do uxplay-windows: o script usa só o PowerShell 5.1 que
 2. Abra o uxplay-windows. Quando o Firewall do Windows perguntar, libere **só em rede privada** (não marque rede pública).
 3. No ícone do uxplay-windows (perto do relógio), botão direito: **desmarque "Enable Bluetooth Discovery"** e reinicie o app. Esse anúncio usa o mesmo Bluetooth do controle e pode atrapalhar; o Bonjour já faz o iPhone achar o PC.
 4. Baixe/clone este repositório numa pasta qualquer.
+5. Dois cliques no **`instalar.bat`**, uma vez. Ele gera o painel `bin\iPhoneControl.exe` a partir de `app\iPhoneControl.cs` (com o compilador que já vem no Windows) e cria o atalho **iPhone Control** na Área de Trabalho e no Menu Iniciar. Depois de atualizar o repositório (`git pull`), rode o `instalar.bat` de novo: ele fecha o painel aberto e gera o novo. O `.exe` não vai para o git.
 
-**Atalho do dia a dia:** dois cliques no `iniciar.bat` abrem o espelho com as opções recomendadas (decodificação por software, que evita a imagem estragada em placas Intel) e já abrem o controle. Repassa argumentos ao `iphone-control.ps1` (ex.: `iniciar.bat -Relative`).
+**Dia a dia: abra pelo ícone iPhone Control.** O painel liga o espelho com as opções recomendadas (decodificação por software, que evita a imagem estragada em placas Intel; desliga o "Bluetooth Discovery" do uxplay-windows), abre o uxplay-windows se estiver fechado e roda o controle escondido, sem janela de terminal.
+
+## Painel (iPhone Control)
+
+- **Status ao vivo:** *Conectado* (verde), *Sem iPhone* (cinza, mostra o nome do PC para parear), *Espelho fechado* (vermelho), *Iniciando* e *Parado*.
+- **Botões:** Voltar, Home, Apps; campo **Abrir app** (digite o nome e Enter, igual ao `abrir <nome>`); **Sugerir** (roda o `sugerir.ps1`); **Respostas** (menu com as do `respostas.txt`, mais "Editar respostas…"); interruptores **Captura do mouse e teclado** e **Espelho sempre no topo**; **Pasta de logs**.
+- **Fechar (X) não desliga:** o painel vai para a bandeja (perto do relógio). Clique no ícone para abrir de novo; botão direito: Abrir, Sugerir resposta, **Sair**. Só o *Sair* encerra o controle. Não inicia junto com o Windows.
+- Se o controle cair, o painel reinicia sozinho (até 3 vezes por minuto). Depois disso mostra *Parado* com a última linha do log; clique no selo para tentar de novo.
+- Se um controle já estiver aberto no terminal, o painel usa ele em vez de abrir outro.
+- Segue o tema claro/escuro do Windows. Erros do painel ficam em `logs\painel-erro-AAAAMMDD.log`.
+- `iPhoneControl.exe --sair` fecha o painel aberto (o mesmo que bandeja > Sair).
+
+**Modo terminal (continua funcionando):** dois cliques no `iniciar.bat` fazem o mesmo num terminal, com o console de comandos. Repassa argumentos ao `iphone-control.ps1` (ex.: `iniciar.bat -Relative`). Não use os dois ao mesmo tempo.
 
 ## Primeira vez: parear
 
@@ -96,6 +109,8 @@ Opções úteis:
 - `-NoFit` — não encaixa a janela do espelho na altura da tela.
 - `-PasteNewlines` — no Ctrl+V, quebra de linha vira Enter (cuidado: no WhatsApp Enter envia).
 - `-PasteMax 4000` — limite de caracteres do Ctrl+V.
+- `-WheelThreshold 40` — rodinha: soma de movimento para o primeiro deslize de uma rajada (depois 1 deslize a cada 120, que é um "clique" de rodinha comum). Ajuda em mouse de rolagem fina, que manda movimentos pequenos.
+- `-Headless` — sem console: comandos só pelo canal local (é como o painel roda o controle). `quit` pelo canal encerra.
 - `-Relative -RelWidth N -RelHeight N` — plano B se o ponteiro absoluto não funcionar no seu iPhone (precisa calibrar).
 
 ## Canal local para automação
@@ -113,7 +128,7 @@ Coordenadas vão de 0 a 1 dentro da área do vídeo (0 0 = canto superior esquer
 ## Problemas comuns
 
 - **Pareou mas não mexe / mudou de versão do script:** o iOS guarda a descrição antiga do aparelho. No iPhone, **Ajustes > Bluetooth > (i) ao lado do PC > Esquecer Este Dispositivo**, e pareie de novo.
-- **Rodinha não rola:** a cada rajada da rodinha o console mostra uma linha `Rodinha: ...` dizendo se foi para o iPhone ou por que foi ignorada (captura desligada, fora da área de vídeo, outra janela por cima).
+- **Rodinha não rola:** mouse de rolagem fina manda movimentos pequenos; o padrão já rola a partir de 40. Se ainda falhar, tente `-WheelThreshold 20`. A cada rajada da rodinha o console mostra uma linha `Rodinha: ...` dizendo se foi para o iPhone ou por que foi ignorada (captura desligada, fora da área de vídeo, outra janela por cima).
 - **Imagem estragada, congelada ou toque caindo no lugar errado:** pare o espelhamento no iPhone e espelhe de novo. Se o toque continuar deslocado, rode `calibrate` no console.
 - **Bolinha do AssistiveTouch atrapalhando a tela:** em **Ajustes > Acessibilidade > Toque > AssistiveTouch**, baixe a **Opacidade em Repouso**.
 - **iPhone não acha o uxplay-windows:** quase sempre é firewall ou rede marcada como Pública. Confira a regra do `uxplay.exe` em rede Privada.

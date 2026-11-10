@@ -14,6 +14,7 @@
 #   ... -Screenshot            salva so a area de video da janela em .tmp\screen.png
 #   ... -Send "tap 0.5 0.5"    manda um comando para o app rodando (canal local 127.0.0.1)
 #   ... -Relative              mouse relativo (plano B, precisa calibrar -RelWidth/-RelHeight)
+#   ... -Headless              sem console: comandos so pelo canal local (usado pelo painel iPhoneControl.exe); 'quit' encerra
 #
 # Com o app rodando:
 #   clique/arraste na janela do espelho = toque/arraste no iPhone; roda do mouse = rolagem
@@ -35,11 +36,13 @@ param(
     [int]$Port = 47380,
     [switch]$PasteNewlines, [int]$PasteMax = 4000,    # colar: por padrao quebra de linha vira espaco (Enter envia no WhatsApp)
     [double]$ScrollStep = 0.18, [int]$ScrollMs = 400,   # roda do mouse = swipe: fracao da altura por tick, duracao do swipe
+    [int]$WheelThreshold = 40,                         # rodinha: soma de delta para o 1o tick de uma rajada (depois 1 tick a cada 120)
     [double]$VideoAspect = 0,
     [switch]$NoFit,                                    # nao encaixar a janela do espelho na altura util da tela
     [int]$KeyDelayMs = 12,                             # pausa apos apertar e apos soltar cada tecla (12 = valor testado; menor = mais rapido)
     [double]$BackX = 0.05, [double]$BackY = 0.077,     # 'voltar' / Esc: toque no botao "<" do canto superior esquerdo (retrato)
-    [string]$WindowTitle = 'AirPlay Video Stream'
+    [string]$WindowTitle = 'AirPlay Video Stream',
+    [switch]$Headless                                  # sem ler o console (painel iPhoneControl.exe); comandos so pelo canal local
 )
 
 $ErrorActionPreference = 'Stop'
@@ -272,9 +275,13 @@ public static class IPC {
     }
 
     // Rodinha: sem exigir "Connected" (era a regressao: com ele falso a rodinha passava para o Windows e o iPhone nao rolava;
-    // sem iPhone o PowerShell so ignora e avisa). Aceita rodinha injetada (driver de mouse com rolagem suave injeta) e
-    // acumula deltas pequenos ate 120 = 1 tick. Diagnostico: 1 linha por rajada (recebida, injetada?, motivo se ignorada).
-    static int wheelAcc = 0, lastWheelTick = -100000;
+    // sem iPhone o PowerShell so ignora e avisa). Aceita rodinha injetada (driver de mouse com rolagem suave injeta).
+    // Rodinha de alta resolucao manda deltas pequenos (medido: -13, 26). Por rajada (mesmo sentido, pausa < 1000 ms) soma os
+    // deltas: o 1o tick sai quando |soma| >= WheelThreshold (padrao 40) e depois 1 tick a cada 120 a mais, entao um clique
+    // normal (120) continua = 1 tick e uma rajada lenta de deltas pequenos rola ao menos 1 vez por ~120 somado.
+    // Diagnostico: 1 linha por rajada (recebida, injetada?, motivo se ignorada).
+    public static int WheelThreshold = 40;
+    static int wheelSum = 0, wheelSent = 0, lastWheelTick = -100000;
     static IntPtr WheelProc(int code, IntPtr w, IntPtr l, MSLL m, bool injected) {
         int now = Environment.TickCount;
         int delta = (short)((m.mouseData >> 16) & 0xFFFF);
@@ -290,11 +297,12 @@ public static class IPC {
         }
         if (newBurst) Push("wheeldiag Rodinha: delta " + delta + (injected ? " (injetada)" : "") + (why == null ? " -> rola o iPhone" : " -> IGNORADA: " + why) + " | iPhone inscrito=" + (Connected ? "sim" : "nao"));
         if (why != null) { lastWheelTick = now; return CallNextHookEx(IntPtr.Zero, code, w, l); }
-        if (now - lastWheelTick > 400) wheelAcc = 0;
+        if (now - lastWheelTick > 1000 || (wheelSum != 0 && (delta > 0) != (wheelSum > 0))) { wheelSum = 0; wheelSent = 0; }   // pausa ou mudou o sentido
         lastWheelTick = now;
-        wheelAcc += delta;
-        int ticks = wheelAcc / 120;
-        if (ticks != 0) { wheelAcc -= ticks * 120; Push("wheel " + ticks + " " + Norm(v, m.pt)); }
+        wheelSum += delta;
+        int abs = Math.Abs(wheelSum), th = Math.Max(1, Math.Min(120, WheelThreshold));
+        int want = abs >= th ? 1 + (abs - th) / 120 : 0;
+        if (want > wheelSent) { int ticks = (want - wheelSent) * Math.Sign(wheelSum); wheelSent = want; Push("wheel " + ticks + " " + Norm(v, m.pt)); }
         return new IntPtr(1);
     }
 
@@ -918,6 +926,7 @@ public static class IPC {
 Add-Type -TypeDefinition $cs -ReferencedAssemblies System.Drawing, System.Windows.Forms -Language CSharp
 $dpi = [IPC]::InitDpi()
 [IPC]::Title = $WindowTitle
+[IPC]::WheelThreshold = $WheelThreshold
 if ($VideoAspect -gt 0) { [IPC]::VideoAspect = $VideoAspect }
 [IPC]::AutoFit = -not $NoFit; if ($NoFit) { [IPC]::FitStatus = 'desligado (-NoFit)' }
 
@@ -938,6 +947,7 @@ New-Item -ItemType Directory -Force (Join-Path $here 'logs') | Out-Null
 $logFile = Join-Path $here ("logs\control-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))
 $script:promptShown = $false
 $script:buffer = ''
+$script:quitRequested = $false
 function Log([string]$msg, [string]$color = 'Gray') {
     $line = '[{0:HH:mm:ss}] {1}' -f (Get-Date), $msg
     if ($script:promptShown) { try { [Console]::Write("`r" + (' ' * ([Console]::WindowWidth - 1)) + "`r") } catch {} }
@@ -1440,10 +1450,18 @@ function HandleCommand([string]$line) {
                 if ($a.Count -and $a[0] -eq 'off') { [IPC]::AutoFit = $false; [IPC]::FitStatus = 'desligado'; return 'afixar desligado' }
                 if ($a.Count -and $a[0] -eq 'plan') { return ([IPC]::FitNow($false)) }
                 return ([IPC]::FitNow($true)) }
+            'topo' {
+                if ($a.Count -and $a[0] -eq 'on') { [IPC]::MirrorTopmost = $true } elseif ($a.Count -and $a[0] -eq 'off') { [IPC]::MirrorTopmost = $false } else { [IPC]::MirrorTopmost = -not [IPC]::MirrorTopmost }
+                [IPC]::ApplyTopmost(); return "espelho sempre no topo $(if ([IPC]::MirrorTopmost) { 'ligado' } else { 'desligado' })" }
+            'estado' {
+                # resumo curto para o painel (chave=valor separados por espaco)
+                $d = [IPC]::Describe(); $win = if ($d -like 'janela*nao encontrada') { 0 } else { 1 }
+                return "ponteiro=$(SubCount $script:mouseReport) teclado=$(SubCount $script:kbReport) janela=$win captura=$(if ([IPC]::Enabled) { 1 } else { 0 }) topo=$(if ([IPC]::MirrorTopmost) { 1 } else { 0 }) anuncio=$($script:provider.AdvertisementStatus) pid=$PID" }
+            { $_ -in 'quit', 'sair' } { $script:quitRequested = $true; return 'ok saindo' }
             'on' { [IPC]::Enabled = $true; return 'captura ligada' }
             'off' { [IPC]::Enabled = $false; return 'captura desligada' }
             'status' { return "modo=$(if ($Relative) { 'relativo' } else { 'absoluto' }) captura=$(if ([IPC]::Enabled) { 'on' } else { 'off' }) $($script:lastSubs) | $([IPC]::Describe()) | hooks: $([IPC]::HookStatus) | anuncio: $($script:provider.AdvertisementStatus) | $(NotifyStats) | KeyDelayMs=$KeyDelayMs | topo=$(if ([IPC]::MirrorTopmost) { 'on' } else { 'off' }) | afixar=$(if ([IPC]::AutoFit) { 'on' } else { 'off' }) ($([IPC]::FitStatus)) | indicador: $([IPC]::OverlayStatus) | proporcao salva: $(if ($script:savedAspect -gt 0) { '{0:0.0000}' -f $script:savedAspect } else { 'nenhuma' }) | voltar em $BackX $BackY$(BeaconWarn)" }
-            'help' { return 'type <texto> | key enter|backspace|tab|esc|space|delete|up|down|left|right|cmd+a [n] | tap x y | longpress x y [ms] | swipe x1 y1 x2 y2 [ms] | scroll n [x y] | home | homeswipe | voltar [x y] | apps | abrir <app> | /r [nome] (resposta pronta, sem Enter) | respostas | sugerir | paste (clipboard do PC; Esc cancela) | clip (mostra o clipboard sem digitar) | screenshot [nome.png em .tmp] | calibrate | fit [on|off|plan] | on | off | status   (x,y de 0 a 1 na area de video)' }
+            'help' { return 'type <texto> | key enter|backspace|tab|esc|space|delete|up|down|left|right|cmd+a [n] | tap x y | longpress x y [ms] | swipe x1 y1 x2 y2 [ms] | scroll n [x y] | home | homeswipe | voltar [x y] | apps | abrir <app> | /r [nome] (resposta pronta, sem Enter) | respostas | sugerir | paste (clipboard do PC; Esc cancela) | clip (mostra o clipboard sem digitar) | screenshot [nome.png em .tmp] | calibrate | fit [on|off|plan] | topo [on|off] | on | off | status | estado | quit   (x,y de 0 a 1 na area de video)' }
         }
     } catch { return "ERRO: $($_.Exception.Message)" }
     "ERRO: comando desconhecido '$cmd' (help)"
@@ -1667,6 +1685,7 @@ function ShowPrompt {
     [Console]::Write("[$st$cap] > " + $script:buffer)
 }
 Write-Host ""
+if ($Headless) { Log "Modo sem console (-Headless): comandos so pelo canal local; 'quit' encerra." 'Cyan' }
 Write-Host "=== Pronto. iPhone: Ajustes > Bluetooth > $env:COMPUTERNAME | AssistiveTouch ligado ===" -ForegroundColor Cyan
 Write-Host "Clique na janela '$WindowTitle' = toque | janela em foco = teclado vai pro iPhone | Ctrl+Shift+F12 liga/desliga"
 Write-Host "Ctrl+Shift+F11 = espelho sempre no topo | Ctrl+Shift+F10 = afixar na altura da tela | Esc cancela um colar longo | console: 'clip' mostra o clipboard sem digitar"
@@ -1676,12 +1695,12 @@ $script:savedAspect = LoadSavedAspect
 if ($VideoAspect -le 0 -and $script:savedAspect -gt 0) { [IPC]::VideoAspect = $script:savedAspect; Log ("Proporcao salva carregada: {0:0.0000} (a deteccao confere quando a janela aparecer)" -f $script:savedAspect) 'Cyan' }
 $script:btnSince = $null
 PollState; CheckWindow
-$script:promptShown = $true; ShowPrompt
+$script:promptShown = -not $Headless; if (-not $Headless) { ShowPrompt }
 $lastPoll = Get-Date
 try {
     while ($true) {
         $busy = $false
-        if ([Console]::KeyAvailable) {
+        if (-not $Headless -and [Console]::KeyAvailable) {
             $busy = $true
             $k = [Console]::ReadKey($true)
             if ($k.Key -eq 'Enter') {
@@ -1690,12 +1709,13 @@ try {
                 if ($line -eq 'q') { break }
                 if ($line -ne '') {
                     $first = ($line -split '\s+')[0].ToLower()
-                    if (@('type', 'key', 'tap', 'longpress', 'swipe', 'scroll', 'home', 'homeswipe', 'voltar', 'apps', 'abrir', '/r', 'respostas', 'sugerir', 'paste', 'clip', 'zero', 'relmove', 'screenshot', 'calibrate', 'fit', 'on', 'off', 'status', 'help') -contains $first) { $r = HandleCommand $line }
+                    if (@('type', 'key', 'tap', 'longpress', 'swipe', 'scroll', 'home', 'homeswipe', 'voltar', 'apps', 'abrir', '/r', 'respostas', 'sugerir', 'paste', 'clip', 'zero', 'relmove', 'screenshot', 'calibrate', 'fit', 'topo', 'estado', 'quit', 'sair', 'on', 'off', 'status', 'help') -contains $first) { $r = HandleCommand $line }
                     elseif ($line -eq '/enter') { $r = SendKeyCombo 'enter' }
                     elseif ($line -match '^/apaga\s*(\d*)$') { $r = SendKeyCombo 'backspace' $(if ($Matches[1]) { [int]$Matches[1] } else { 1 }) }
                     else { $r = SendText $line }
                     Log "$line -> $r" $(if ($r -like 'ok*') { 'Gray' } else { 'Yellow' })
                 }
+                if ($script:quitRequested) { break }
                 $script:promptShown = $true; ShowPrompt
             } elseif ($k.Key -eq 'Backspace') {
                 if ($script:buffer.Length -gt 0) { $script:buffer = $script:buffer.Substring(0, $script:buffer.Length - 1); [Console]::Write("`b `b") }
@@ -1708,6 +1728,7 @@ try {
             $busy = $true
             $req.Resp = HandleCommand $req.Cmd; $req.Done.Set()
             Log "[canal] $($req.Cmd) -> $($req.Resp)" 'DarkGray'
+            if ($script:quitRequested) { Start-Sleep -Milliseconds 150; break }   # da tempo da resposta sair antes de fechar o canal
         }
         if (((Get-Date) - $lastPoll).TotalSeconds -ge 2) {
             $lastPoll = Get-Date; PollState; CheckWindow

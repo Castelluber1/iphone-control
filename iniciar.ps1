@@ -13,6 +13,7 @@
 #   -Fps N                  limite de quadros (padrao do UxPlay = 30)
 #   -ComSom                 mantem a sincronia audio/video do UxPlay (padrao aqui = -vsync no, menos atraso)
 #   -SoEspelho              nao abre o iphone-control.ps1
+#   -DesligarBeacon         desliga 'Enable Bluetooth Discovery' do uxplay-windows (ble_enabled=false no registro; vale no proximo inicio do app)
 #   -Extra "..."            opcoes a mais do UxPlay, coladas no fim
 #   Qualquer outro argumento e repassado ao iphone-control.ps1 (ex.: -Relative)
 param(
@@ -21,6 +22,7 @@ param(
     [int]$Fps = 0,
     [switch]$ComSom,
     [switch]$SoEspelho,
+    [switch]$DesligarBeacon,
     [string]$Extra = '',
     [Parameter(ValueFromRemainingArguments = $true)] $Resto
 )
@@ -58,6 +60,11 @@ if ($old -ne $line) {
 
 # 3. Avisos sobre configuracoes da bandeja (so leitura)
 $s = Get-ItemProperty $reg -ErrorAction SilentlyContinue
+if ($DesligarBeacon -and $s -and "$($s.ble_enabled)" -ne 'false') {
+    Set-ItemProperty -Path $reg -Name 'ble_enabled' -Value 'false' -Type String
+    Write-Host "ble_enabled=false (Bluetooth Discovery do uxplay desligado; vale no proximo inicio do uxplay-windows)" -ForegroundColor Cyan
+    $s = Get-ItemProperty $reg -ErrorAction SilentlyContinue
+}
 if ($s -and "$($s.ble_enabled)" -eq 'true') {
     Write-Host "AVISO: 'Enable Bluetooth Discovery' esta ligado no uxplay-windows. Ele roda o uxplay-bluetooth-beacon.exe," -ForegroundColor Yellow
     Write-Host "       que anuncia no MESMO Bluetooth do teclado/mouse do iphone-control. O Bonjour ja faz a descoberta;" -ForegroundColor Yellow
