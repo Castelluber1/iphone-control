@@ -36,6 +36,7 @@ param(
     [int]$Port = 47380,
     [switch]$PasteNewlines, [int]$PasteMax = 4000,    # colar: por padrao quebra de linha vira espaco (Enter envia no WhatsApp)
     [double]$ScrollStep = 0.18, [int]$ScrollMs = 400,   # roda do mouse = swipe: fracao da altura por tick, duracao do swipe
+    [int]$WheelUnits = 6,                              # rodinha: unidades de roda HID enviadas ao iPhone por clique da rodinha do PC
     [int]$WheelThreshold = 40,                         # rodinha: soma de delta para o 1o tick de uma rajada (depois 1 tick a cada 120)
     [double]$VideoAspect = 0,
     [switch]$NoFit,                                    # nao encaixar a janela do espelho na altura util da tela
@@ -1292,6 +1293,58 @@ function DoScrollSwipe([int]$ticks, [double]$u, [double]$v) {
     if ($dir -gt 0 -and $v1 + $d -gt $hi) { $v1 = $hi - $d }
     DoSwipe $u $v1 $u ($v1 + $dir * $d) $ScrollMs
 }
+# Rodinha "segurando": o dedo encosta no 1o tick, acompanha cada tick enquanto a rodinha gira e so solta
+# quando ela para (~220 ms). Sem o "clica e solta" de um swipe por tick. Ao chegar na borda da faixa segura,
+# para, solta e reencosta do outro lado (parado antes de soltar = sem arremesso por inercia).
+function WheelDrag([int]$ticks, [double]$u) {
+    if (-not (Ready)) { return 'NAO ENVIADO: iPhone sem inscricao' }
+    $lo = 0.2; $hi = 0.85
+    $u = [Math]::Max(0.1, [Math]::Min(0.9, $u))
+    $y = if ($ticks -lt 0) { $hi } else { $lo }     # comeca na ponta oposta ao movimento = curso maximo
+    $down = $false
+    $pending = [double]$ticks * $ScrollStep
+    $idle = [Diagnostics.Stopwatch]::StartNew(); $more = $null
+    while ($true) {
+        while ([Math]::Abs($pending) -gt 0.0001) {
+            if (-not $down) {
+                # encosta e ja sai andando >= 0.06: dedo parado depois de encostar vira toque longo (abre menu da mensagem)
+                $r = PointerDown $u $y; if ($r -ne 'ok') { return $r }
+                $down = $true
+                if ([Math]::Abs($pending) -lt 0.06) { $pending = [Math]::Sign($pending) * 0.06 }
+            }
+            $stepV = [Math]::Sign($pending) * [Math]::Min(0.02, [Math]::Abs($pending))
+            $ny = $y + $stepV
+            if ($ny -lt $lo -or $ny -gt $hi) {
+                # fim do curso: para, solta e reencosta do outro lado so quando houver movimento de novo
+                Start-Sleep -Milliseconds 40; PointerUp; $down = $false
+                $y = if ($stepV -lt 0) { $hi } else { $lo }
+                continue
+            }
+            $y = $ny; $pending -= $stepV
+            PointerMove $u $y; Start-Sleep -Milliseconds 8
+        }
+        $more = $null
+        if ([IPC]::Events.TryPeek([ref]$more) -and $more.StartsWith('wheel ')) {
+            $null = [IPC]::Events.TryDequeue([ref]$more); $pending += [int]($more.Split(' ')[1]) * $ScrollStep; $idle.Restart()
+        } elseif ($more -and -not $more.StartsWith('wheel') ) { break }
+        elseif ($idle.ElapsedMilliseconds -gt 220) { break }
+        else { Start-Sleep -Milliseconds 8 }
+    }
+    if ($down) { PointerUp }
+    'ok'
+}
+# Rolagem pela rodinha HID de verdade, sem botao apertado: nunca vira toque. O swipe (dedo encosta e arrasta) as vezes
+# era lido como toque e abria o item embaixo do cursor (relato do Caio, 2026-11-10); a rodinha HID rolou o WhatsApp no teste.
+# ticks do Windows: negativo = rodinha pra baixo = conteudo anda pra baixo -> no iPhone isso e roda HID positiva.
+function HidWheel([int]$ticks, [double]$u, [double]$v) {
+    if ($ticks -eq 0) { return 'ok (0 ticks)' }
+    if (-not (Ready)) { return 'NAO ENVIADO: iPhone sem inscricao' }
+    $s = - [Math]::Sign($ticks); $n = [Math]::Min(60, [Math]::Max(8, [Math]::Abs($ticks) * $WheelUnits))   # menos de ~8 unidades o iOS nao rola (teste: 6 nao mexeu, 10 rolou)
+    $null = AbsReport $u $v 0
+    for ($k = 0; $k -lt $n; $k++) { $null = AbsReport $u $v 0 $s; Start-Sleep -Milliseconds 12 }
+    $null = AbsReport $u $v 0 0
+    'ok'
+}
 function DoWheel([int]$dir, [double]$u, [double]$v) {
     if ($Relative) { $null = RelReport 0 0 $script:btn $dir } else { $null = AbsReport $u $v $script:btn $dir }
 }
@@ -1423,7 +1476,14 @@ function HandleCommand([string]$line) {
             'longpress' { $ms = if ($a.Count -gt 2) { [int]$a[2] } else { 800 }; return (DoTap (N $a[0]) (N $a[1]) $ms) }
             'swipe' { $ms = if ($a.Count -gt 4) { [int]$a[4] } else { 300 }; return (DoSwipe (N $a[0]) (N $a[1]) (N $a[2]) (N $a[3]) $ms) }
             'scroll' { $d = [int]$a[0]; $u = if ($a.Count -gt 2) { N $a[1] } else { 0.5 }; $v = if ($a.Count -gt 2) { N $a[2] } else { 0.5 }
-                if (-not (Ready)) { return 'NAO ENVIADO: iPhone sem inscricao' }; return (DoScrollSwipe $d $u $v) }
+                if (-not (Ready)) { return 'NAO ENVIADO: iPhone sem inscricao' }; return (HidWheel $d $u $v) }
+            'hwheel' {   # rodinha HID de verdade (sem botao: nunca vira toque). hwheel n [x y] [ms entre relatorios]
+                $d = [int]$a[0]; $u = if ($a.Count -ge 3) { N $a[1] } else { 0.5 }; $v = if ($a.Count -ge 3) { N $a[2] } else { 0.5 }
+                $gap = if ($a.Count -ge 4) { [int]$a[3] } else { 25 }
+                if (-not (Ready)) { return 'NAO ENVIADO: iPhone sem inscricao' }
+                $null = AbsReport $u $v 0; Start-Sleep -Milliseconds 40
+                $s = [Math]::Sign($d); for ($k = 0; $k -lt [Math]::Abs($d); $k++) { $null = AbsReport $u $v 0 $s; Start-Sleep -Milliseconds $gap }
+                $null = AbsReport $u $v 0 0; return "ok hwheel $d" }
             'home' { if (-not (Ready)) { return 'NAO ENVIADO: iPhone sem inscricao' }; $null = ConsumerTap 0x0040; return 'ok (consumer 0x0040; se nao voltar pra tela inicial use: homeswipe)' }
             'homeswipe' { return (DoSwipe 0.5 0.995 0.5 0.55 250) }
             'voltar' { if ($a.Count -ge 2) { return (DoBack (N $a[0]) (N $a[1])) }; return (DoBack) }
@@ -1496,19 +1556,20 @@ function ProcessHookEvents {
             'move' { PointerMove (N $p[1]) (N $p[2]) }
             'up' { if ($p.Count -ge 3) { PointerMove (N $p[1]) (N $p[2]) }; PointerUp }
             'wheel' {
-                # junta os ticks seguidos (deste lote + os que chegarem em 80 ms) num swipe so
+                # junta os ticks seguidos (deste lote + os que chegarem em 80 ms) num swipe so.
+                # E o comportamento da 1a versao, que funcionava; o WheelDrag (dedo segurando) nao rolou (teste 2026-11-10).
                 $ticks = [int]$p[1]; $wu = N $p[2]; $wv = N $p[3]
                 while ($i + 1 -lt $list.Count -and $list[$i + 1].StartsWith('wheel ')) { $i++; $ticks += [int]($list[$i].Split(' ')[1]) }
                 if ($i + 1 -ge $list.Count) {
                     $sw = [Diagnostics.Stopwatch]::StartNew(); $more = $null
                     while ($sw.ElapsedMilliseconds -lt 80) {
                         if ([IPC]::Events.TryPeek([ref]$more) -and $more.StartsWith('wheel ')) { $null = [IPC]::Events.TryDequeue([ref]$more); $ticks += [int]($more.Split(' ')[1]); $sw.Restart() }
-                        elseif ($more -and -not $more.StartsWith('wheel ')) { break }
+                        elseif ($more -and -not $more.StartsWith('wheel')) { break }
                         else { Start-Sleep -Milliseconds 5 }
                         $more = $null
                     }
                 }
-                $null = DoScrollSwipe $ticks $wu $wv
+                $null = HidWheel $ticks $wu $wv
             }
             'key' { $null = Tap ([byte][int]$p[2]) ([byte][int]$p[1]) }
             'text' { foreach ($c in $e.Substring(5).ToCharArray()) { if (-not (TypeChar $c)) { Log "Sem mapa para '$c'" 'Yellow' } } }
