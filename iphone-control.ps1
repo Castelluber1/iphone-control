@@ -22,6 +22,7 @@
 #   Ctrl+Shift+V = Cmd+V (cola o clipboard do proprio iPhone)
 #   Ctrl+Shift+F12 = liga/desliga a captura (de qualquer janela)
 #   Ctrl+Shift+F11 = janela do espelho sempre no topo (liga/desliga)
+#   Ctrl+Shift+F10 = afixar o espelho na altura da tela (liga/desliga; padrao ligado, -NoFit desliga)
 #   Esc durante um Ctrl+V longo = cancela a digitacao | chip CONTROLE LIGADO/DESLIGADO na barra de titulo do espelho
 #   No console: mesmos comandos do canal local (ver HandleCommand), texto solto = digitar, q = sair
 param(
@@ -33,6 +34,7 @@ param(
     [switch]$PasteNewlines, [int]$PasteMax = 4000,    # colar: por padrao quebra de linha vira espaco (Enter envia no WhatsApp)
     [double]$ScrollStep = 0.18, [int]$ScrollMs = 400,   # roda do mouse = swipe: fracao da altura por tick, duracao do swipe
     [double]$VideoAspect = 0,
+    [switch]$NoFit,                                    # nao encaixar a janela do espelho na altura util da tela
     [int]$KeyDelayMs = 12,                             # pausa apos apertar e apos soltar cada tecla (12 = valor testado; menor = mais rapido)
     [string]$WindowTitle = 'AirPlay Video Stream'
 )
@@ -439,6 +441,11 @@ public static class IPC {
                     Enabled = !Enabled; if (!Enabled) CancelTyping = true; Push("toggle " + (Enabled ? "on" : "off"));
                     return new IntPtr(1);
                 }
+                if (down && vk == 0x79 && ctrl && shift) {                              // Ctrl+Shift+F10: afixar na altura da tela
+                    AutoFit = !AutoFit; if (AutoFit) { FitReason = "religado"; FitRequest = true; actBurst = 0; }
+                    FitStatus = AutoFit ? "ligado" : "desligado"; Push("fit " + (AutoFit ? "on" : "off"));
+                    return new IntPtr(1);
+                }
                 if (down && vk == 0x7A && ctrl && shift) {                              // Ctrl+Shift+F11: espelho sempre no topo
                     MirrorTopmost = !MirrorTopmost; ApplyTopmost(); Push("topmost " + (MirrorTopmost ? "on" : "off"));
                     return new IntPtr(1);
@@ -488,6 +495,118 @@ public static class IPC {
         SetWindowPos(h, MirrorTopmost ? new IntPtr(-1) : new IntPtr(-2), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010);   // NOSIZE|NOMOVE|NOACTIVATE
         topmostApplied = MirrorTopmost ? h : IntPtr.Zero;
     }
+
+    // ---------------- afixar na altura da tela: a janela cabe inteira na area util (acima da barra de tarefas) ----------------
+    // Coordenadas fisicas (processo PerMonitorV2). Janela nova / video girou = encaixa: altura util - margem, largura pela
+    // proporcao, topo no topo da area util, mesma posicao horizontal. Fora isso so corrige se a janela sair da area util.
+    [StructLayout(LayoutKind.Sequential)] struct MONITORINFO { public int cbSize; public RECT rcMonitor, rcWork; public uint dwFlags; }
+    [StructLayout(LayoutKind.Sequential)] struct GUITHREADINFO { public int cbSize; public uint flags; public IntPtr hwndActive, hwndFocus, hwndCapture, hwndMenuOwner, hwndMoveSize, hwndCaret; public RECT rcCaret; }
+    [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr h, uint f);
+    [DllImport("user32.dll")] static extern bool GetMonitorInfo(IntPtr m, ref MONITORINFO mi);
+    [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int a, out RECT r, int n);
+    [DllImport("user32.dll")] static extern bool IsZoomed(IntPtr h);
+    [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
+    [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint tid, ref GUITHREADINFO g);
+    public static volatile bool AutoFit = true, FitRequest = false;
+    public static string FitStatus = "aguardando a janela", FitReason = "";
+    static IntPtr fitHwnd = IntPtr.Zero;
+    static bool fitPendingNew = false;
+    static int fitSeenTick, lastFitTick, lastActTick, burstStart, actBurst;
+    static double lastFitAspect = 0;
+
+    // Pura (testavel): retangulo VISIVEL da janela {x, y, w, h} dentro da area util.
+    public static int[] ComputeFit(int wl, int wt, int wr, int wb, int ncW, int ncH, double aspect, int margin, int curL) {
+        int workW = wr - wl, workH = wb - wt;
+        int fh = workH - margin;
+        int ch = Math.Max(50, fh - ncH);
+        int cw = (int)Math.Round(ch * aspect);
+        int fw = cw + ncW;
+        int maxW = workW - 2 * margin;
+        if (fw > maxW) { fw = maxW; cw = Math.Max(50, fw - ncW); ch = (int)Math.Round(cw / aspect); fh = ch + ncH; }
+        int x = Math.Max(wl, Math.Min(wr - fw, curL));
+        return new int[] { x, wt, fw, fh };
+    }
+    // proporcao do video: a detectada, ou a da area cliente quando o video ocupa a janela toda
+    public static double EffectiveAspect(double a) {
+        if (a > 0) return a;
+        RECT c; if (!ClientScreen(Window(), out c)) return 0;
+        return (double)(c.R - c.L) / (c.B - c.T);
+    }
+    static bool FitGeo(IntPtr h, out RECT wr, out RECT fr, out RECT c, out RECT work, out int margin) {
+        wr = new RECT(); fr = new RECT(); c = new RECT(); work = new RECT(); margin = 8;
+        if (h == IntPtr.Zero || !GetWindowRect(h, out wr) || !ClientScreen(h, out c)) return false;
+        // retangulo visivel (sem a borda invisivel de redimensionar do Windows 10/11)
+        try { if (DwmGetWindowAttribute(h, 9, out fr, Marshal.SizeOf(typeof(RECT))) != 0 || fr.R <= fr.L) fr = wr; } catch (Exception) { fr = wr; }
+        IntPtr mon = MonitorFromWindow(h, 2);                  // MONITOR_DEFAULTTONEAREST: monitor onde a janela esta
+        MONITORINFO mi = new MONITORINFO(); mi.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
+        if (mon == IntPtr.Zero || !GetMonitorInfo(mon, ref mi)) return false;
+        work = mi.rcWork;
+        double sc = 1.0; try { uint d = GetDpiForWindow(h); if (d > 0) sc = d / 96.0; } catch (Exception) { }
+        margin = (int)Math.Round(8 * sc);
+        return true;
+    }
+    static string DoFit(IntPtr h, bool apply, string reason) {
+        RECT wr, fr, c, work; int m;
+        if (!FitGeo(h, out wr, out fr, out c, out work, out m)) return "sem geometria (janela fechada ou minimizada?)";
+        double a = EffectiveAspect(VideoAspect);
+        if (a < 0.05 || a > 20) return "proporcao desconhecida";
+        int ncW = (fr.R - fr.L) - (c.R - c.L), ncH = (fr.B - fr.T) - (c.B - c.T);   // barra de titulo + bordas visiveis
+        int[] q = ComputeFit(work.L, work.T, work.R, work.B, ncW, ncH, a, m, fr.L);
+        int dl = fr.L - wr.L, dt = fr.T - wr.T, dr = wr.R - fr.R, db = wr.B - fr.B;
+        string s = string.Format(CultureInfo.InvariantCulture, "area util {0}x{1} em ({2},{3}); janela {4}x{5} em ({6},{7}) -> {8}x{9} em ({10},{11}); proporcao {12:0.0000}; {13}",
+            work.R - work.L, work.B - work.T, work.L, work.T, fr.R - fr.L, fr.B - fr.T, fr.L, fr.T, q[2], q[3], q[0], q[1], a, reason);
+        if (!apply) return "plano: " + s;
+        SetWindowPos(h, IntPtr.Zero, q[0] - dl, q[1] - dt, q[2] + dl + dr, q[3] + dt + db, 0x0010 | 0x0004 | 0x0200);   // NOACTIVATE|NOZORDER|NOOWNERZORDER
+        lastFitAspect = a; lastFitTick = Environment.TickCount;
+        return "encaixada: " + s;
+    }
+    static bool InsideWork(RECT f, RECT w) { return f.L >= w.L - 1 && f.T >= w.T - 1 && f.R <= w.R + 1 && f.B <= w.B + 1; }
+    static bool UserBusy(IntPtr h) {                           // nao briga: botao apertado ou arrastando/redimensionando
+        if (dragging) return true;
+        if ((GetAsyncKeyState(0x01) & 0x8000) != 0 || (GetAsyncKeyState(0x02) & 0x8000) != 0) return true;
+        GUITHREADINFO g = new GUITHREADINFO(); g.cbSize = Marshal.SizeOf(typeof(GUITHREADINFO));
+        return GetGUIThreadInfo(GetWindowThreadProcessId(h, IntPtr.Zero), ref g) && (g.flags & 0x2) != 0;   // GUI_INMOVESIZE
+    }
+    // comando 'fit' do console/canal: aplica agora (apply=false so mostra o plano)
+    public static string FitNow(bool apply) {
+        IntPtr h = Window(); if (h == IntPtr.Zero) return "janela '" + Title + "' nao encontrada";
+        if (IsIconic(h) || IsZoomed(h)) return "janela minimizada/maximizada: nada a fazer";
+        string r = DoFit(h, apply, "comando"); if (apply) FitStatus = r; return r;
+    }
+    // chamado pelo PowerShell quando a proporcao do video e (re)detectada
+    public static void AspectChanged() {
+        double va = EffectiveAspect(VideoAspect), la = lastFitAspect;
+        if (va <= 0 || la <= 0) return;
+        if ((va < 1) != (la < 1)) { FitReason = "video girou"; FitRequest = true; }
+        else if (Environment.TickCount - lastFitTick < 10000 && Math.Abs(va - la) / la > 0.03) { FitReason = "ajuste fino da proporcao"; FitRequest = true; }
+    }
+    static void FitTick(IntPtr h) {
+        if (h == IntPtr.Zero || !IsWindowVisible(h)) { fitHwnd = IntPtr.Zero; return; }
+        int now = Environment.TickCount;
+        if (h != fitHwnd) { fitHwnd = h; fitSeenTick = now; fitPendingNew = true; }
+        if (!AutoFit || IsIconic(h) || IsZoomed(h) || UserBusy(h)) return;
+        if (now - lastActTick < 800) return;
+        if (fitPendingNew && now - fitSeenTick < 1200) return;   // deixa o uxplay terminar de abrir/dimensionar
+        RECT wr, fr, c, work; int m;
+        if (!FitGeo(h, out wr, out fr, out c, out work, out m)) return;
+        string r = null;
+        if (fitPendingNew || FitRequest) {
+            r = DoFit(h, true, fitPendingNew ? "janela nova" : FitReason); fitPendingNew = false; FitRequest = false;
+        } else if (!InsideWork(fr, work)) {
+            if (fr.B - fr.T > work.B - work.T || fr.R - fr.L > work.R - work.L) r = DoFit(h, true, "maior que a area util");
+            else {
+                int fw = fr.R - fr.L, fh = fr.B - fr.T;
+                int x = Math.Max(work.L, Math.Min(work.R - fw, fr.L)), y = Math.Max(work.T, Math.Min(work.B - fh, fr.T));
+                SetWindowPos(h, IntPtr.Zero, x - (fr.L - wr.L), y - (fr.T - wr.T), 0, 0, 0x0001 | 0x0010 | 0x0004 | 0x0200);   // NOSIZE|NOACTIVATE|NOZORDER
+                r = string.Format("movida para dentro da area util: ({0},{1}) -> ({2},{3})", fr.L, fr.T, x, y);
+            }
+        }
+        if (r == null) return;
+        lastActTick = now;
+        if (now - burstStart > 15000) { burstStart = now; actBurst = 0; }
+        if (++actBurst > 6) { AutoFit = false; FitStatus = "pausado: a janela nao fica no lugar (Ctrl+Shift+F10 religa)"; Push("fitlog Afixar " + FitStatus); return; }
+        FitStatus = r; Push("fitlog Afixar: " + r);
+    }
     class Chip : System.Windows.Forms.Form {
         public bool On = true; public string Text2 = ""; public Font F;
         protected override bool ShowWithoutActivation { get { return true; } }
@@ -534,6 +653,7 @@ public static class IPC {
     static void OverlayTick(Chip f) {
         IntPtr h = Window();
         if (MirrorTopmost && h != IntPtr.Zero && h != topmostApplied) ApplyTopmost();   // janela renasceu: reaplica
+        try { FitTick(h); } catch (Exception ex) { FitStatus = "erro: " + ex.Message; }
         RECT wr, c;
         if (h == IntPtr.Zero || !IsWindowVisible(h) || IsIconic(h) || !GetWindowRect(h, out wr) || !ClientScreen(h, out c)) { if (f.Visible) f.Hide(); return; }
         double sc = 1.0; try { uint d = GetDpiForWindow(h); if (d > 0) sc = d / 96.0; } catch (Exception) { }
@@ -637,6 +757,16 @@ public static class IPC {
             return "falhou " + info;
         }
     }
+    // Igual, mas nao altera VideoAspect (para conferir se o video girou antes de aceitar).
+    public static bool PeekAspect(out double a, out string info) {
+        a = 0; info = "";
+        IntPtr h = Window();
+        if (h == IntPtr.Zero || IsIconic(h)) { info = "janela nao encontrada"; return false; }
+        using (Bitmap cl = CaptureClient(h)) {
+            if (cl == null) { info = "nao consegui capturar"; return false; }
+            return DetectBars(cl, out a, out info);
+        }
+    }
 
     // ---------------- canal de comandos: HTTP minimo so em 127.0.0.1 ----------------
     public class Req { public string Cmd; public string Resp = ""; public ManualResetEventSlim Done = new ManualResetEventSlim(false); }
@@ -730,6 +860,7 @@ Add-Type -TypeDefinition $cs -ReferencedAssemblies System.Drawing, System.Window
 $dpi = [IPC]::InitDpi()
 [IPC]::Title = $WindowTitle
 if ($VideoAspect -gt 0) { [IPC]::VideoAspect = $VideoAspect }
+[IPC]::AutoFit = -not $NoFit; if ($NoFit) { [IPC]::FitStatus = 'desligado (-NoFit)' }
 
 # ======================================================================================================
 # -Screenshot sozinho (sem Bluetooth)
@@ -1131,10 +1262,15 @@ function HandleCommand([string]$line) {
                 return ([IPC]::Screenshot($p)) }
             'clip' { return (ClipInfo) }
             'calibrate' { return ([IPC]::DetectAspect() + ' | ' + [IPC]::Describe()) }
+            'fit' {
+                if ($a.Count -and $a[0] -eq 'on') { [IPC]::AutoFit = $true; [IPC]::FitReason = 'religado'; [IPC]::FitRequest = $true; [IPC]::FitStatus = 'ligado'; return 'afixar ligado' }
+                if ($a.Count -and $a[0] -eq 'off') { [IPC]::AutoFit = $false; [IPC]::FitStatus = 'desligado'; return 'afixar desligado' }
+                if ($a.Count -and $a[0] -eq 'plan') { return ([IPC]::FitNow($false)) }
+                return ([IPC]::FitNow($true)) }
             'on' { [IPC]::Enabled = $true; return 'captura ligada' }
             'off' { [IPC]::Enabled = $false; return 'captura desligada' }
-            'status' { return "modo=$(if ($Relative) { 'relativo' } else { 'absoluto' }) captura=$(if ([IPC]::Enabled) { 'on' } else { 'off' }) $($script:lastSubs) | $([IPC]::Describe()) | hooks: $([IPC]::HookStatus) | anuncio: $($script:provider.AdvertisementStatus) | $(NotifyStats) | KeyDelayMs=$KeyDelayMs | topo=$(if ([IPC]::MirrorTopmost) { 'on' } else { 'off' }) | indicador: $([IPC]::OverlayStatus)$(BeaconWarn)" }
-            'help' { return 'type <texto> | key enter|backspace|tab|esc|space|delete|up|down|left|right|cmd+a [n] | tap x y | longpress x y [ms] | swipe x1 y1 x2 y2 [ms] | scroll n [x y] | home | homeswipe | paste (clipboard do PC; Esc cancela) | clip (mostra o clipboard sem digitar) | screenshot [nome.png em .tmp] | calibrate | on | off | status   (x,y de 0 a 1 na area de video)' }
+            'status' { return "modo=$(if ($Relative) { 'relativo' } else { 'absoluto' }) captura=$(if ([IPC]::Enabled) { 'on' } else { 'off' }) $($script:lastSubs) | $([IPC]::Describe()) | hooks: $([IPC]::HookStatus) | anuncio: $($script:provider.AdvertisementStatus) | $(NotifyStats) | KeyDelayMs=$KeyDelayMs | topo=$(if ([IPC]::MirrorTopmost) { 'on' } else { 'off' }) | afixar=$(if ([IPC]::AutoFit) { 'on' } else { 'off' }) ($([IPC]::FitStatus)) | indicador: $([IPC]::OverlayStatus)$(BeaconWarn)" }
+            'help' { return 'type <texto> | key enter|backspace|tab|esc|space|delete|up|down|left|right|cmd+a [n] | tap x y | longpress x y [ms] | swipe x1 y1 x2 y2 [ms] | scroll n [x y] | home | homeswipe | paste (clipboard do PC; Esc cancela) | clip (mostra o clipboard sem digitar) | screenshot [nome.png em .tmp] | calibrate | fit [on|off|plan] | on | off | status   (x,y de 0 a 1 na area de video)' }
         }
     } catch { return "ERRO: $($_.Exception.Message)" }
     "ERRO: comando desconhecido '$cmd' (help)"
@@ -1153,6 +1289,8 @@ function ProcessHookEvents {
         $p = $e.Split(' ')
         if ($p[0] -eq 'toggle') { Log "Captura: $($p[1]) (Ctrl+Shift+F12)" 'Cyan'; continue }
         if ($p[0] -eq 'topmost') { Log "Espelho sempre no topo: $($p[1]) (Ctrl+Shift+F11)" 'Cyan'; continue }
+        if ($p[0] -eq 'fit') { Log "Afixar na altura da tela: $($p[1]) (Ctrl+Shift+F10)" 'Cyan'; continue }
+        if ($p[0] -eq 'fitlog') { Log $e.Substring(7) 'Cyan'; continue }
         if (-not (Ready)) {
             if (((Get-Date) - $script:lastWarn).TotalSeconds -gt 3) { $script:lastWarn = Get-Date; Log 'Evento ignorado: iPhone sem inscricao (pareado e conectado?)' 'Yellow' }
             continue
@@ -1184,16 +1322,24 @@ function ProcessHookEvents {
     $true
 }
 
-# Proporcao do video: tenta detectar faixas pretas quando a janela aparece ou muda de tamanho
-$script:aspectKey = ''; $script:aspectDone = $false
+# Proporcao do video: tenta detectar faixas pretas quando a janela aparece ou muda de tamanho,
+# e confere a cada ciclo se o video girou (retrato <-> paisagem) dentro da mesma janela.
+$script:aspectKey = ''; $script:aspectDone = $false; $script:flipCount = 0
 function CheckWindow {
     $d = [IPC]::Describe()
     $key = ($d -split ';')[0]
-    if ($key -ne $script:aspectKey) { $script:aspectKey = $key; $script:aspectDone = $false; Log "Janela: $d" 'Cyan' }
-    if (-not $script:aspectDone -and $VideoAspect -le 0 -and $d -like 'cliente*') {
+    if ($key -ne $script:aspectKey) { $script:aspectKey = $key; $script:aspectDone = $false; $script:flipCount = 0; Log "Janela: $d" 'Cyan' }
+    if ($VideoAspect -gt 0 -or $d -notlike 'cliente*') { return }
+    if (-not $script:aspectDone) {
         $r = [IPC]::DetectAspect()
-        if ($r -like 'ok*') { $script:aspectDone = $true; Log "Area de video: $r | $([IPC]::Describe())" 'Cyan' }
+        if ($r -like 'ok*') { $script:aspectDone = $true; Log "Area de video: $r | $([IPC]::Describe())" 'Cyan'; [IPC]::AspectChanged() }
+        return
     }
+    $na = 0.0; $info = ''
+    if ([IPC]::PeekAspect([ref]$na, [ref]$info) -and (([IPC]::EffectiveAspect($na) -lt 1) -ne ([IPC]::EffectiveAspect([IPC]::VideoAspect) -lt 1))) {
+        $script:flipCount++                                    # 2 leituras seguidas antes de aceitar (tela escura engana)
+        if ($script:flipCount -ge 2) { [IPC]::VideoAspect = $na; $script:flipCount = 0; Log "Video girou: $info | $([IPC]::Describe())" 'Cyan'; [IPC]::AspectChanged() }
+    } else { $script:flipCount = 0 }
 }
 
 # ======================================================================================================
@@ -1231,6 +1377,14 @@ if ($SelfTest -or $SelfTestAdvertise) {
     Check 'Letterbox lateral' ($q[0] -eq 200 -and $q[2] -eq 400) "($($q -join ','))"
     $q = [IPC]::ComputeVideoRect(300, 900, 0.5)
     Check 'Letterbox vertical' ($q[1] -eq 150 -and $q[3] -eq 600) "($($q -join ','))"
+
+    # 2b. afixar na altura da tela (conta pura): area util 2560x1528, barra de titulo+bordas 2x31, margem 12
+    $q = [IPC]::ComputeFit(0, 0, 2560, 1528, 2, 31, 0.4618, 12, 2400)
+    Check 'Afixar retrato: altura util - margem, largura pela proporcao, dentro da tela' ($q[1] -eq 0 -and $q[3] -eq 1516 -and $q[2] -eq ([Math]::Round(1485 * 0.4618) + 2) -and $q[0] + $q[2] -le 2560 -and $q[0] -lt 2400) "($($q -join ','))"
+    $q = [IPC]::ComputeFit(0, 0, 2560, 1528, 2, 31, 2.1655, 12, 300)
+    Check 'Afixar paisagem: limita pela largura' ($q[2] -eq 2536 -and $q[3] -le 1516 -and $q[0] -eq 24) "($($q -join ','))"
+    $q = [IPC]::ComputeFit(-1920, 40, 0, 1080, 2, 31, 0.4618, 8, -900)
+    Check 'Afixar em monitor a esquerda (coordenada negativa)' ($q[0] -eq -900 -and $q[1] -eq 40 -and $q[3] -eq 1032) "($($q -join ','))"
     $bmp = New-Object System.Drawing.Bitmap 200, 400
     $gfx = [System.Drawing.Graphics]::FromImage($bmp); $gfx.Clear([System.Drawing.Color]::Black); $gfx.FillRectangle([System.Drawing.Brushes]::White, 20, 0, 160, 400); $gfx.Dispose()
     $asp = 0.0; $info = ''
@@ -1247,6 +1401,7 @@ if ($SelfTest -or $SelfTestAdvertise) {
     $d = [IPC]::Describe(); Log "Janela '$WindowTitle': $d"
     if ($d -like 'cliente*') {
         Log "Deteccao de proporcao: $([IPC]::DetectAspect())"
+        Log "Afixar (so o plano, nao mexe na janela): $([IPC]::FitNow($false))"
         $r = [IPC]::Screenshot($ScreenshotPath); Check 'Screenshot da janela do espelho' ($r -like 'ok*') $r
     } else {
         Log 'Janela do espelho nao aberta: testo a captura na janela deste console.' 'Yellow'
@@ -1311,7 +1466,7 @@ try { [IPC]::StartServer($Port); Log "Canal local: http://127.0.0.1:$Port/ (so l
 catch { Log "Canal local NAO abriu na porta ${Port}: $($_.Exception.Message)" 'Yellow' }
 [IPC]::StartHooks(); Log "Hooks: $([IPC]::HookStatus)"
 [IPC]::FastTimer($true)
-[IPC]::StartOverlay(); Log "Indicador de captura: $([IPC]::OverlayStatus) | Ctrl+Shift+F11 = espelho sempre no topo"
+[IPC]::StartOverlay(); Log "Indicador de captura: $([IPC]::OverlayStatus) | Ctrl+Shift+F11 = espelho sempre no topo | afixar na altura da tela: $(if ([IPC]::AutoFit) { 'ligado' } else { 'desligado' }) (Ctrl+Shift+F10)"
 $bw = BeaconWarn; if ($bw) { Log $bw.TrimStart(' |') 'Yellow' }
 $script:titleOn = $null
 function UpdateTitle { $on = [IPC]::Enabled; if ($on -ne $script:titleOn) { $script:titleOn = $on; try { $Host.UI.RawUI.WindowTitle = "iPhone: controle $(if ($on) { 'ON' } else { 'OFF' })" } catch {} } }
@@ -1324,7 +1479,7 @@ function ShowPrompt {
 Write-Host ""
 Write-Host "=== Pronto. iPhone: Ajustes > Bluetooth > $env:COMPUTERNAME | AssistiveTouch ligado ===" -ForegroundColor Cyan
 Write-Host "Clique na janela '$WindowTitle' = toque | janela em foco = teclado vai pro iPhone | Ctrl+Shift+F12 liga/desliga"
-Write-Host "Ctrl+Shift+F11 = espelho sempre no topo | Esc cancela um colar longo | console: 'clip' mostra o clipboard sem digitar"
+Write-Host "Ctrl+Shift+F11 = espelho sempre no topo | Ctrl+Shift+F10 = afixar na altura da tela | Esc cancela um colar longo | console: 'clip' mostra o clipboard sem digitar"
 Write-Host "Console: texto solto = digitar | help = comandos | q = sair"
 PollState; CheckWindow
 $script:promptShown = $true; ShowPrompt
@@ -1341,7 +1496,7 @@ try {
                 if ($line -eq 'q') { break }
                 if ($line -ne '') {
                     $first = ($line -split '\s+')[0].ToLower()
-                    if (@('type', 'key', 'tap', 'longpress', 'swipe', 'scroll', 'home', 'homeswipe', 'paste', 'clip', 'zero', 'relmove', 'screenshot', 'calibrate', 'on', 'off', 'status', 'help') -contains $first) { $r = HandleCommand $line }
+                    if (@('type', 'key', 'tap', 'longpress', 'swipe', 'scroll', 'home', 'homeswipe', 'paste', 'clip', 'zero', 'relmove', 'screenshot', 'calibrate', 'fit', 'on', 'off', 'status', 'help') -contains $first) { $r = HandleCommand $line }
                     elseif ($line -eq '/enter') { $r = SendKeyCombo 'enter' }
                     elseif ($line -match '^/apaga\s*(\d*)$') { $r = SendKeyCombo 'backspace' $(if ($Matches[1]) { [int]$Matches[1] } else { 1 }) }
                     else { $r = SendText $line }

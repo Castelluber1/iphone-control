@@ -64,9 +64,12 @@ Com o script rodando e a tela espelhada:
 | **Ctrl+Shift+V** | Cmd+V (cola o que está copiado no próprio iPhone) |
 | **Ctrl+Shift+F12** | Liga/desliga a captura (funciona de qualquer janela) |
 | **Ctrl+Shift+F11** | Liga/desliga "sempre no topo" na janela do espelho |
+| **Ctrl+Shift+F10** | Liga/desliga "afixar na altura da tela" |
 | **Esc** durante um Ctrl+V longo | Cancela a digitação |
 
 Um selo **CONTROLE LIGADO / DESLIGADO** aparece na barra de título do espelho.
+
+**Afixar na altura da tela** (ligado por padrão): quando a janela do espelho aparece, ou quando o vídeo gira entre retrato e paisagem, ela é encaixada na área útil do monitor onde está (acima da barra de tarefas): altura da tela menos uma margem pequena, largura pela proporção do vídeo, topo encostado no topo, mesma posição horizontal. Se você mover ou redimensionar na mão, o script só mexe quando a janela sai da área útil. `-NoFit` desliga; no console, `fit` reencaixa agora e `fit on` / `fit off` liga e desliga.
 
 O primeiro clique numa janela sem foco só dá foco a ela (e também conta como toque).
 
@@ -74,6 +77,7 @@ No console do script dá para digitar comandos (`help` lista todos): texto solto
 
 Opções úteis:
 
+- `-NoFit` — não encaixa a janela do espelho na altura da tela.
 - `-PasteNewlines` — no Ctrl+V, quebra de linha vira Enter (cuidado: no WhatsApp Enter envia).
 - `-PasteMax 4000` — limite de caracteres do Ctrl+V.
 - `-Relative -RelWidth N -RelHeight N` — plano B se o ponteiro absoluto não funcionar no seu iPhone (precisa calibrar).
