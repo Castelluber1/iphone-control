@@ -7,4 +7,4 @@ ok = Combinado, já te retorno.
 depois = Agora não consigo falar, te chamo mais tarde.
 obrigado = Muito obrigado!
 chegando = Estou chegando, uns 10 minutos.
-oi = {saudacao}, tudo bem?
+oi = {saudacao} {nome}, tudo bem?

@@ -1418,8 +1418,66 @@ function Saudacao {
     try { $now = [TimeZoneInfo]::ConvertTime([DateTime]::Now, [TimeZoneInfo]::FindSystemTimeZoneById($SaudacaoFuso)) } catch {}
     if ($now.Hour -ge 5 -and $now.Hour -lt 12) { 'Bom dia' } elseif ($now.Hour -ge 12 -and $now.Hour -lt 18) { 'Boa tarde' } else { 'Boa noite' }
 }
+# {nome} = primeiro nome de quem esta na conversa aberta, lido por OCR do Windows (pt-BR, ~0,5 s):
+# 1) titulo da conversa (contato salvo); 2) linha "~Nome" do cartao do WhatsApp (contato nao salvo, no comeco da conversa).
+# Se so tiver numero, devolve '' e o texto sai sem nome ("Bom dia, tudo bem?").
+$script:ocrReady = $null
+function OcrLines([string]$path) {
+    if ($null -eq $script:ocrReady) {
+        try {
+            $null = [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
+            $null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType = WindowsRuntime]
+            $null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
+            $null = [Windows.Globalization.Language, Windows.Globalization, ContentType = WindowsRuntime]
+            $script:ocrEngine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage([Windows.Globalization.Language]::new('pt-BR'))
+            if (-not $script:ocrEngine) { $script:ocrEngine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages() }
+            $script:ocrReady = [bool]$script:ocrEngine
+        } catch { $script:ocrReady = $false }
+    }
+    if (-not $script:ocrReady) { return , @() }
+    $f = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($path)) ([Windows.Storage.StorageFile])
+    $s = Await ($f.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+    try {
+        $d = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($s)) ([Windows.Graphics.Imaging.BitmapDecoder])
+        $b = Await ($d.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+        $res = Await ($script:ocrEngine.RecognizeAsync($b)) ([Windows.Media.Ocr.OcrResult])
+        , @($res.Lines | ForEach-Object { [string]$_.Text })
+    } finally { $s.Dispose() }
+}
+function FirstName([string]$t) {
+    $t = ($t -replace '^[\s~]+', '').Trim()
+    if ($t -eq '' -or $t -match '^[\d\s\+\-\(\)\.]+$') { return '' }          # so numero de telefone
+    $w = ($t -split '\s+')[0] -replace '[^\p{L}\-'']', ''
+    if ($w.Length -lt 2) { return '' }
+    $w.Substring(0, 1).ToUpper() + $w.Substring(1).ToLower()
+}
+function ContactName {
+    try {
+        $shot = Join-Path $tmpDir 'nome.png'; $hdr = Join-Path $tmpDir 'nome-topo.png'
+        $r = [IPC]::Screenshot($shot); if ($r -notlike 'ok*') { return '' }
+        Add-Type -AssemblyName System.Drawing
+        $img = [System.Drawing.Image]::FromFile($shot)
+        try {
+            $w = $img.Width; $h = $img.Height
+            $crop = New-Object System.Drawing.Bitmap ([int]($w * 0.6)), ([int]($h * 0.045))
+            $g = [System.Drawing.Graphics]::FromImage($crop)
+            $g.DrawImage($img, (New-Object System.Drawing.Rectangle 0, 0, $crop.Width, $crop.Height), (New-Object System.Drawing.Rectangle ([int]($w * 0.2)), ([int]($h * 0.055)), $crop.Width, $crop.Height), [System.Drawing.GraphicsUnit]::Pixel)
+            $g.Dispose(); $crop.Save($hdr); $crop.Dispose()
+        } finally { $img.Dispose() }
+        $top = @(OcrLines $hdr)
+        $n = if ($top.Count -gt 0) { FirstName $top[0] } else { '' }
+        if ($n -eq '') { $card = @(OcrLines $shot) | Where-Object { $_ -match '^\s*~\s*\S' } | Select-Object -First 1; if ($card) { $n = FirstName $card } }
+        Remove-Item -LiteralPath $shot, $hdr -ErrorAction SilentlyContinue
+        $n
+    } catch { '' }
+}
 function SendResposta($r) {
     $texto = $r.Texto
+    if ($texto -match '\{nome\}') {
+        $nome = ContactName
+        $texto = if ($nome) { $texto -replace '\{nome\}', $nome } else { $texto -replace '[ ,]*\{nome\}', '' }
+        Log ("Nome detectado: " + $(if ($nome) { $nome } else { '(nenhum, so numero)' })) 'DarkGray'
+    }
     if ($texto -match '\{saudacao\}') {
         $s = Saudacao
         $texto = [regex]::Replace($texto, '\{saudacao\}', { param($m) if ($m.Index -eq 0) { $s } else { $s.ToLower() } })
@@ -1501,6 +1559,7 @@ function HandleCommand([string]$line) {
             'swipe' { $ms = if ($a.Count -gt 4) { [int]$a[4] } else { 300 }; return (DoSwipe (N $a[0]) (N $a[1]) (N $a[2]) (N $a[3]) $ms) }
             'scroll' { $d = [int]$a[0]; $u = if ($a.Count -gt 2) { N $a[1] } else { 0.5 }; $v = if ($a.Count -gt 2) { N $a[2] } else { 0.5 }
                 if (-not (Ready)) { return 'NAO ENVIADO: iPhone sem inscricao' }; return (HidWheel $d $u $v) }
+            'nome' { $n = ContactName; return $(if ($n) { "ok $n" } else { 'ok (nenhum nome, so numero ou nao achei)' }) }   # testa o {nome} sem digitar
             'hwheel' {   # rodinha HID de verdade (sem botao: nunca vira toque). hwheel n [x y] [ms entre relatorios]
                 $d = [int]$a[0]; $u = if ($a.Count -ge 3) { N $a[1] } else { 0.5 }; $v = if ($a.Count -ge 3) { N $a[2] } else { 0.5 }
                 $gap = if ($a.Count -ge 4) { [int]$a[3] } else { 25 }
