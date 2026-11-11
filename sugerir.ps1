@@ -26,6 +26,7 @@ param(
 )
 # padrao: digita a sugestao direto no campo do WhatsApp (sem Enter) e nao abre janela nenhuma
 $Digitar = -not $Janela -and -not $SemJanela
+$MostrarProgresso = -not $SemJanela        # barra "gerando sugestao" aparece sempre, menos com -SemJanela explicito
 if ($Digitar) { $SemJanela = $true }
 
 $ErrorActionPreference = 'Stop'
@@ -177,24 +178,47 @@ $psi.RedirectStandardError = $true
 $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
 $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
 
-# janelinha de progresso (some quando o Codex termina)
+# janelinha de progresso: texto + barra que enche (some quando a sugestao fica pronta). Nao rouba o foco.
+# O Codex nao informa o progresso de verdade: a barra segue o tempo tipico (~15 s) e desacelera perto do fim.
 $prog = $null
-if (-not $SemJanela) {
+function Set-Prog([double]$frac, [string]$txt) {
+    if (-not $prog) { return }
+    $progFill.Width = [int]([Math]::Max(0.0, [Math]::Min(1.0, $frac)) * $progTrack.Width)   # 0.0/1.0: com 0/1 o PS escolhe Max(int,int) e arredonda pra 0
+    if ($txt) { $progLbl.Text = $txt }
+    $prog.Refresh(); [System.Windows.Forms.Application]::DoEvents()
+}
+if ($MostrarProgresso) {
+    $dark = $false
+    try { $dark = ((Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -ErrorAction Stop).AppsUseLightTheme -eq 0) } catch {}
+    $bg = if ($dark) { [System.Drawing.Color]::FromArgb(32, 32, 32) } else { [System.Drawing.Color]::White }
+    $fg = if ($dark) { [System.Drawing.Color]::FromArgb(235, 235, 235) } else { [System.Drawing.Color]::FromArgb(32, 32, 32) }
+    $trackC = if ($dark) { [System.Drawing.Color]::FromArgb(60, 60, 60) } else { [System.Drawing.Color]::FromArgb(229, 229, 229) }
     $prog = New-Object System.Windows.Forms.Form
-    $prog.Text = (U 'Sugest\u00e3o de resposta')
-    $prog.FormBorderStyle = 'FixedToolWindow'
-    $prog.StartPosition = 'CenterScreen'
+    $prog.FormBorderStyle = 'None'
+    $prog.StartPosition = 'Manual'
     $prog.TopMost = $true
     $prog.ShowInTaskbar = $false
-    $prog.ClientSize = New-Object System.Drawing.Size(340, 60)
+    $prog.BackColor = $bg
+    $prog.ClientSize = New-Object System.Drawing.Size(300, 64)
+    $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $prog.Location = New-Object System.Drawing.Point(($wa.Right - 300 - 24), ($wa.Bottom - 64 - 24))
     $progLbl = New-Object System.Windows.Forms.Label
-    $progLbl.Dock = 'Fill'
-    $progLbl.TextAlign = 'MiddleCenter'
+    $progLbl.Location = New-Object System.Drawing.Point(16, 12); $progLbl.Size = New-Object System.Drawing.Size(268, 20)
     $progLbl.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+    $progLbl.ForeColor = $fg
     $progLbl.Text = (U 'Gerando sugest\u00e3o...')
-    $prog.Controls.Add($progLbl)
-    $prog.Show()
-    [System.Windows.Forms.Application]::DoEvents()
+    $progTrack = New-Object System.Windows.Forms.Panel
+    $progTrack.Location = New-Object System.Drawing.Point(16, 40); $progTrack.Size = New-Object System.Drawing.Size(268, 6)
+    $progTrack.BackColor = $trackC
+    $progFill = New-Object System.Windows.Forms.Panel
+    $progFill.Location = New-Object System.Drawing.Point(0, 0); $progFill.Size = New-Object System.Drawing.Size(0, 6)
+    $progFill.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
+    $progTrack.Controls.Add($progFill)
+    $prog.Controls.Add($progLbl); $prog.Controls.Add($progTrack)
+    # mostra sem ativar (o foco continua no espelho/WhatsApp)
+    $prog.Add_Shown({ $prog.TopMost = $true })
+    [void]$prog.GetType().GetMethod('SetVisibleCore', [Reflection.BindingFlags]'NonPublic,Instance').Invoke($prog, @($true))
+    Set-Prog 0.03 ''
 }
 
 Say "Enviando o print ao Codex (timeout $TimeoutSec s)..." 'Cyan'
@@ -219,7 +243,7 @@ while (-not $proc.WaitForExit(200)) {
         Write-Host -NoNewline ("`r  aguardando o Codex... {0} s " -f $s)
         if ($prog) { $progLbl.Text = (U 'Gerando sugest\u00e3o... ') + "$s s" }
     }
-    if ($prog) { [System.Windows.Forms.Application]::DoEvents() }
+    if ($prog) { Set-Prog (0.95 * (1 - [Math]::Exp(-$sw.Elapsed.TotalSeconds / 7))) '' }
     if ($sw.Elapsed.TotalSeconds -ge $TimeoutSec) {
         $timedOut = $true
         try { & taskkill.exe /PID $proc.Id /T /F 2>&1 | Out-Null } catch {}
@@ -229,7 +253,7 @@ while (-not $proc.WaitForExit(200)) {
 Write-Host ''
 $sw.Stop()
 $secs = [Math]::Round($sw.Elapsed.TotalSeconds, 1)
-if ($prog) { $prog.Close(); $prog.Dispose(); $prog = $null }
+if ($prog) { Set-Prog 1 $(if ($timedOut) { (U 'O Codex demorou demais') } else { (U 'Pronto, digitando no WhatsApp...') }); Start-Sleep -Milliseconds 450; $prog.Close(); $prog.Dispose(); $prog = $null }
 
 if ($timedOut) { Cleanup; Log "TIMEOUT origem=$origem t=${secs}s"; Fail "O Codex passou de $TimeoutSec s e foi interrompido. Tente de novo (ou -TimeoutSec maior)." }
 

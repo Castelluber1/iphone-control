@@ -238,6 +238,7 @@ public static class IPC {
         HookStatus = "parado";
     }
 
+    static int lastHoverTick = -100000;
     static IntPtr MouseProc(int code, IntPtr w, IntPtr l) {
         try {
             if (code >= 0) {
@@ -258,6 +259,14 @@ public static class IPC {
                             dragging = false;
                             Push("up " + (VideoRect(Window(), out v) ? Norm(v, m.pt) : ""));
                             if (!passThrough) return new IntPtr(1);
+                        }
+                    } else if (Enabled && !injected && msg == 0x0200 && Environment.TickCount - lastHoverTick >= 30) {
+                        // passando o mouse por cima do espelho: o ponteiro do iPhone acompanha (sem botao), assim o
+                        // clique ja encontra o ponteiro no lugar certo e nao cai onde ele estava antes
+                        IntPtr h = Window();
+                        if (h != IntPtr.Zero && VideoRect(h, out v) && Inside(v, m.pt) && GetAncestor(WindowFromPoint(m.pt), 2) == h) {
+                            lastHoverTick = Environment.TickCount;
+                            Push("hover " + Norm(v, m.pt));
                         }
                     } else if (Enabled && !injected && msg == 0x0201) {
                         IntPtr h = Window();
@@ -1251,7 +1260,10 @@ function RelReady { $RelWidth -gt 0 -and $RelHeight -gt 0 }
 # iOS ignora X/Y num relatorio que muda o botao: primeiro posiciona, espera, depois aperta.
 function PointerDown([double]$u, [double]$v) {
     if ($Relative) { if (-not (RelReady)) { return 'ERRO: modo relativo sem calibrar (-RelWidth/-RelHeight)' }; RelZero; RelMoveTo $u $v; Start-Sleep -Milliseconds 60; $script:btn = 1; $null = RelReport 0 0 1; return 'ok' }
-    $null = AbsReport $u $v 0; Start-Sleep -Milliseconds 60
+    # posicao enviada 2x e espera maior: com o Bluetooth lento o aperto chegava antes e caia onde o ponteiro estava
+    # (relato 2026-11-11: voltar abria o perfil, clique no campo comecava audio)
+    $null = AbsReport $u $v 0; Start-Sleep -Milliseconds 45
+    $null = AbsReport $u $v 0; Start-Sleep -Milliseconds 45
     $script:btn = 1; $null = AbsReport $u $v 1; 'ok'
 }
 function PointerMove([double]$u, [double]$v) {
@@ -1539,6 +1551,7 @@ function ProcessHookEvents {
     for ($i = 0; $i -lt $list.Count; $i++) {
         $e = $list[$i]
         if ($e.StartsWith('move ') -and $i + 1 -lt $list.Count -and $list[$i + 1].StartsWith('move ')) { continue }   # junta movimentos
+        if ($e.StartsWith('hover ') -and $i + 1 -lt $list.Count -and $list[$i + 1].StartsWith('hover ')) { continue } # so a posicao mais nova
         $p = $e.Split(' ')
         if ($p[0] -eq 'toggle') { Log "Captura: $($p[1]) (Ctrl+Shift+F12)" 'Cyan'; continue }
         if ($p[0] -eq 'topmost') { Log "Espelho sempre no topo: $($p[1]) (Ctrl+Shift+F11)" 'Cyan'; continue }
@@ -1554,6 +1567,7 @@ function ProcessHookEvents {
         switch ($p[0]) {
             'down' { $r = PointerDown (N $p[1]) (N $p[2]); if ($r -ne 'ok') { Log $r 'Yellow' } }
             'move' { PointerMove (N $p[1]) (N $p[2]) }
+            'hover' { if ($script:btn -eq 0) { $null = AbsReport (N $p[1]) (N $p[2]) 0 } }
             'up' { if ($p.Count -ge 3) { PointerMove (N $p[1]) (N $p[2]) }; PointerUp }
             'wheel' {
                 # junta os ticks seguidos (deste lote + os que chegarem em 80 ms) num swipe so.
