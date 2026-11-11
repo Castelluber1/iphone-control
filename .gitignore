@@ -18,3 +18,4 @@ respostas.txt
 # painel gerado pelo instalar.ps1 (compila app\iPhoneControl.cs)
 bin/
 *.exe
+sugerir-contexto-sync.cmd

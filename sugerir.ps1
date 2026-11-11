@@ -125,9 +125,17 @@ Regras:
 - Se nao der para ler a conversa no print, responda exatamente: [nao consegui ler a conversa no print]
 - Devolva SOMENTE o texto da resposta, sem aspas, sem explicacao, sem markdown, sem opcoes alternativas.
 '@
+# sugerir-contexto-sync.cmd (opcional, fora do git): regenera o contexto se ele tiver mais de 6 h (ex.: puxa o prompt
+# de atendimento que esta no ar). Falhou ou demorou? segue com o contexto que ja existe.
+$syncCmd = Join-Path $here 'sugerir-contexto-sync.cmd'
+if ((Test-Path $syncCmd) -and (-not (Test-Path $ctxFile) -or ((Get-Date) - (Get-Item $ctxFile).LastWriteTime).TotalHours -gt 6)) {
+    try { $sp = Start-Process -FilePath $syncCmd -WindowStyle Hidden -PassThru; if (-not $sp.WaitForExit(20000)) { try { $sp.Kill() } catch {} } } catch {}
+}
 if (Test-Path $ctxFile) {
     $ctx = (Get-Content -Path $ctxFile -Raw -Encoding UTF8)
-    if ($ctx -and $ctx.Trim() -ne '') { $prompt += "`n`nContexto fixo sobre o Caio (use se ajudar, nao invente a partir dele):`n" + $ctx.Trim() }
+    if ($ctx -and $ctx.Trim() -ne '') {
+        $prompt += "`n`nContexto e instrucoes de atendimento. Elas valem MAIS que o 'tom que o Caio ja usa' acima, e os precos, links e condicoes escritos aqui podem ser usados (sao reais):`n" + $ctx.Trim()
+    }
 }
 if ($Instrucao.Trim() -ne '') { $prompt += "`n`nInstrucao extra do Caio para esta resposta: " + $Instrucao.Trim() }
 
