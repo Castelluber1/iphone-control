@@ -36,6 +36,7 @@ param(
     [int]$Port = 47380,
     [switch]$PasteNewlines, [int]$PasteMax = 4000,    # colar: por padrao quebra de linha vira espaco (Enter envia no WhatsApp)
     [double]$ScrollStep = 0.18, [int]$ScrollMs = 400,   # roda do mouse = swipe: fracao da altura por tick, duracao do swipe
+    [string]$SaudacaoFuso = 'E. South America Standard Time',   # fuso do {saudacao} nas respostas prontas (Brasilia)
     [int]$WheelUnits = 6,                              # rodinha: unidades de roda HID enviadas ao iPhone por clique da rodinha do PC
     [int]$WheelThreshold = 40,                         # rodinha: soma de delta para o 1o tick de uma rajada (depois 1 tick a cada 120)
     [double]$VideoAspect = 0,
@@ -1411,8 +1412,19 @@ function ListRespostas {
     if ($rs.Count -eq 0) { return "nenhuma resposta em $respFile (formato: nome = texto)" }
     $i = 0; ($rs | ForEach-Object { $i++; $prev = if ($_.Texto.Length -gt 30) { $_.Texto.Substring(0, 30) + '...' } else { $_.Texto }; $(if ($i -le 9) { "Ctrl+Shift+$i " } else { '' }) + "/r $($_.Nome) = $prev" }) -join ' | '
 }
+# {saudacao} = Bom dia / Boa tarde / Boa noite pelo horario de quem recebe (-SaudacaoFuso, padrao Brasilia)
+function Saudacao {
+    $now = Get-Date
+    try { $now = [TimeZoneInfo]::ConvertTime([DateTime]::Now, [TimeZoneInfo]::FindSystemTimeZoneById($SaudacaoFuso)) } catch {}
+    if ($now.Hour -ge 5 -and $now.Hour -lt 12) { 'Bom dia' } elseif ($now.Hour -ge 12 -and $now.Hour -lt 18) { 'Boa tarde' } else { 'Boa noite' }
+}
 function SendResposta($r) {
-    $t = [IPC]::NormalizePaste($r.Texto) -replace '[\r\n]+', ' '      # sem quebra de linha: nunca vira Enter
+    $texto = $r.Texto
+    if ($texto -match '\{saudacao\}') {
+        $s = Saudacao
+        $texto = [regex]::Replace($texto, '\{saudacao\}', { param($m) if ($m.Index -eq 0) { $s } else { $s.ToLower() } })
+    }
+    $t = [IPC]::NormalizePaste($texto) -replace '[\r\n]+', ' '      # sem quebra de linha: nunca vira Enter
     (SendText $t) + " (resposta '$($r.Nome)', sem Enter)"
 }
 function ReplyByName([string]$name) {
