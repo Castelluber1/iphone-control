@@ -1588,6 +1588,13 @@ function HandleCommand([string]$line) {
                     if (-not $p.StartsWith($base, [StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetExtension($p) -ne '.png') { return "ERRO: screenshot so grava .png dentro de $base" }
                 }
                 return ([IPC]::Screenshot($p)) }
+            'captura' {
+                # botao "Capturar tela" do painel: um print novo por clique em .tmp\capturas, nada e sobrescrito
+                $dir = Join-Path $tmpDir 'capturas'
+                $r = [IPC]::Screenshot((Join-Path $dir ('cap-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.png')))
+                if ($r -notlike 'ok*') { return $r }
+                $n = @(Get-ChildItem $dir -Filter 'cap-*.png').Count
+                return "ok print $n salvo | $r" }
             'clip' { return (ClipInfo) }
             'calibrate' { return ([IPC]::DetectAspect() + ' | ' + [IPC]::Describe()) }
             'fit' {

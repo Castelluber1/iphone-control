@@ -330,7 +330,7 @@ class MainForm : Form {
     readonly string root, binDir, logDir;
     Theme T; float S;
     Font fTitle, fSub, fSection, fLabel, fIcon, fIconBig, fChip, fFoot;
-    Tile bBack, bHome, bApps, bOpen, bSugerir, bResp, bLogs;
+    Tile bBack, bHome, bApps, bOpen, bSugerir, bCaptura, bResp, bLogs;
     Toggle tCap, tTop;
     Field fApp;
     ContextMenuStrip respMenu, trayMenu;
@@ -423,7 +423,8 @@ class MainForm : Form {
         bOpen.Primary = true; bOpen.Click += delegate { OpenApp(); };
         y += 22 + 38 + 18;   // 264
         int hw = (W - 2 * m - 8) / 2;
-        bSugerir = MkTile("", "Sugerir resposta", false, P(m), P(y + 22), P(W - 2 * m), P(42), "sugerir");
+        bSugerir = MkTile("", "Sugerir resposta", false, P(m), P(y + 22), P(hw), P(42), "sugerir");
+        bCaptura = MkTile("", "Capturar tela", false, P(m + hw + 8), P(y + 22), P(W - 2 * m - hw - 8), P(42), "captura");
         y += 22 + 42 + 18;
         // RESPOSTAS: as 4 primeiras do respostas.txt expostas, o resto em "Outros"
         respTop = y;
@@ -590,6 +591,7 @@ class MainForm : Form {
             else if (r.StartsWith("NAO ENVIADO")) msg = "iPhone não conectado";
             else if (!ok) msg = Short(r);
             else if (cmd == "sugerir") msg = "Sugestão a caminho…";
+            else if (cmd == "captura") { int p = r.IndexOf(" salvo"); msg = p > 9 ? "Print " + r.Substring(9, p - 9) + " salvo" : "Print salvo"; }
             else msg = "Enviado";
             try { BeginInvoke((MethodInvoker)delegate { if (from != null) from.Flash(ok); Toast(msg, ok); Poll(); }); } catch (Exception) { }
         });
